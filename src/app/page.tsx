@@ -1,97 +1,114 @@
-"use client";
+import { supabase } from "@/lib/supabase";
 
-import { useEffect, useMemo, useState } from "react";
+type TermRow = {
+  id: number;
+  term: string;
+  definition: string | null;
+  example: string | null;
+  priority: number | null;
+  term_type_id: number | null;
+  modified_datetime_utc: string | null;
+};
 
-const MESSAGES = [
-  "Hello World 👋",
-  "Hello from Kian’s first Vercel deploy 🚀",
-  "Next.js is alive ✅",
-  "Ship it. Then iterate. 🔁",
-  "If it compiles, it vibes 😌",
-];
-
-function formatTime(date: Date) {
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function truncate(text: string, max = 80) {
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1) + "…";
 }
 
-export default function Home() {
-  const [now, setNow] = useState(() => new Date());
-  const [idx, setIdx] = useState(0);
+export default async function Home() {
+  const { data, error } = await supabase
+      .from("terms")
+      .select(
+          "id, term, definition, example, priority, term_type_id, modified_datetime_utc"
+      )
+      .order("priority", { ascending: false, nullsFirst: false })
+      .limit(60); // medium-long, not too long
 
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
+  if (error) {
+    return (
+        <main className="min-h-screen p-8">
+          <h1 className="text-2xl font-semibold">Terms</h1>
+          <p className="mt-4 text-red-600">Error: {error.message}</p>
+          <p className="mt-2 text-slate-500">
+            Double-check your table name and env vars.
+          </p>
+        </main>
+    );
+  }
 
-  const message = useMemo(() => MESSAGES[idx % MESSAGES.length], [idx]);
+  const rows = (data ?? []) as TermRow[];
 
   return (
-      <main className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 text-slate-100">
-        <div className="mx-auto max-w-3xl px-6 py-16">
-          <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-sm text-slate-200">
-            <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-            Deployed-ready • {formatTime(now)}
+      <main className="min-h-screen bg-slate-950 text-slate-100 p-8">
+        <div className="mx-auto max-w-7xl">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h1 className="text-3xl font-semibold">Terms</h1>
+              <p className="mt-1 text-slate-300">
+                Loaded from Supabase table{" "}
+                <code className="font-mono">terms</code>
+              </p>
+            </div>
+
+            <div className="text-sm text-slate-400">
+              Showing <span className="text-slate-200 font-medium">{rows.length}</span>{" "}
+              rows
+            </div>
           </div>
 
-          <h1 className="mt-6 text-4xl font-semibold tracking-tight sm:text-6xl">
-            {message}
-          </h1>
+          <div className="mt-6 overflow-x-auto rounded-xl border border-white/10 bg-white/5">
+            <table className="min-w-[1100px] w-full border-collapse">
+              <thead className="bg-white/5">
+              <tr className="text-left text-xs uppercase tracking-wide text-slate-300">
+                <th className="px-4 py-3">Term</th>
+                <th className="px-4 py-3">Definition</th>
+                <th className="px-4 py-3">Example</th>
+                <th className="px-4 py-3">Priority</th>
+                <th className="px-4 py-3">Type</th>
+                <th className="px-4 py-3">Updated</th>
+              </tr>
+              </thead>
 
-          <p className="mt-4 text-base leading-relaxed text-slate-300 sm:text-lg">
-            This is a tiny Next.js app deployed on Vercel. Click the button to
-            rotate the headline, and refresh to see it stay fast.
+              <tbody>
+              {rows.map((r) => (
+                  <tr
+                      key={r.id}
+                      className="border-t border-white/10 text-sm hover:bg-white/5"
+                  >
+                    <td className="px-4 py-3 font-semibold whitespace-nowrap">
+                      {r.term}
+                    </td>
+
+                    <td className="px-4 py-3 text-slate-200">
+                      {r.definition ? truncate(r.definition, 90) : "—"}
+                    </td>
+
+                    <td className="px-4 py-3 text-slate-300">
+                      {r.example ? truncate(r.example, 90) : "—"}
+                    </td>
+
+                    <td className="px-4 py-3 text-slate-300">
+                      {r.priority ?? "—"}
+                    </td>
+
+                    <td className="px-4 py-3 text-slate-300">
+                      {r.term_type_id ?? "—"}
+                    </td>
+
+                    <td className="px-4 py-3 text-slate-400 whitespace-nowrap">
+                      {r.modified_datetime_utc
+                          ? new Date(r.modified_datetime_utc).toLocaleDateString()
+                          : "—"}
+                    </td>
+                  </tr>
+              ))}
+              </tbody>
+            </table>
+          </div>
+
+          <p className="mt-3 text-xs text-slate-500">
+            Tip: If you want it shorter/longer, change <code className="font-mono">limit(60)</code>.
           </p>
-
-          <div className="mt-8 flex flex-wrap gap-3">
-            <button
-                onClick={() => setIdx((x) => x + 1)}
-                className="rounded-xl bg-white px-4 py-2 text-sm font-medium text-slate-900 transition hover:opacity-90"
-            >
-              Change message
-            </button>
-
-            <a
-                className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/10"
-                href="https://vercel.com"
-                target="_blank"
-                rel="noreferrer"
-            >
-              Learn Vercel
-            </a>
-
-            <a
-                className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/10"
-                href="https://nextjs.org/docs"
-                target="_blank"
-                rel="noreferrer"
-            >
-              Next.js docs
-            </a>
-          </div>
-
-          <div className="mt-10 grid gap-4 sm:grid-cols-2">
-            <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-              <div className="text-sm text-slate-300">Status</div>
-              <div className="mt-2 text-lg font-semibold">All systems go ✅</div>
-              <p className="mt-2 text-sm text-slate-300">
-                You’re running App Router + Tailwind, and your repo is connected to
-                deploy.
-              </p>
-            </div>
-
-            <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-              <div className="text-sm text-slate-300">Next step</div>
-              <div className="mt-2 text-lg font-semibold">Deploy on Vercel 🚀</div>
-              <p className="mt-2 text-sm text-slate-300">
-                Push to GitHub, import into Vercel, turn off Deployment Protection,
-                and submit the URL.
-              </p>
-            </div>
-          </div>
-
-          <footer className="mt-12 text-xs text-slate-400">
-            Built with Next.js • {now.toDateString()}
-          </footer>
         </div>
       </main>
   );
