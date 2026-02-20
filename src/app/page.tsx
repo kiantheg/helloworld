@@ -1,546 +1,966 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-type TermRow = {
-    id: number;
-    term: string;
-    definition: string | null;
-    example: string | null;
-    priority: number | null;
-    term_type_id: number | null;
-    modified_datetime_utc: string | null;
+type CaptionRow = {
+  id: string;
+  content: string | null;
+  image_id: string | null;
+  profile_id: string;
+  like_count: number | null;
+  created_datetime_utc: string | null;
+  images: { url: string | null } | null;
 };
 
-type TermTypeRow = {
-    id: number;
-    name: string;
+type VoteRow = {
+  id: number;
+  caption_id: string;
+  profile_id: string;
+  vote_value: number;
+  created_datetime_utc?: string | null;
 };
 
-function truncate(text: string, max = 80) {
-    if (text.length <= max) return text;
-    return text.slice(0, max - 3) + "...";
-}
+type ImageVariant = "stage" | "card" | "thumb";
+type UndoState = {
+  captionId: string;
+  previousVote: 1 | -1 | 0;
+};
+const LOAD_BATCH_SIZE = 60;
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const supabase =
-    supabaseUrl && supabaseAnonKey
-        ? createClient(supabaseUrl, supabaseAnonKey)
-        : null;
+  supabaseUrl && supabaseAnonKey
+    ? createClient(supabaseUrl, supabaseAnonKey)
+    : null;
+const missingSupabaseError =
+  "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY.";
 
-const palette = [
-    "from-amber-300/30 via-orange-400/30 to-rose-500/30",
-    "from-cyan-300/30 via-sky-400/30 to-indigo-500/30",
-    "from-lime-300/30 via-emerald-400/30 to-teal-500/30",
-    "from-fuchsia-300/30 via-pink-400/30 to-red-500/30",
-    "from-yellow-200/30 via-amber-400/30 to-orange-500/30",
-    "from-sky-300/30 via-blue-400/30 to-violet-500/30",
-];
+const readStoredPrefs = () => {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem("caption-studio-prefs");
+    if (!raw) return null;
+    return JSON.parse(raw) as {
+      viewMode?: "stage" | "wall";
+      sortMode?: "top" | "new";
+      showShortcuts?: boolean;
+      focusMode?: boolean;
+    };
+  } catch {
+    return null;
+  }
+};
 
-const seeded = (seed: number) => {
-    const x = Math.sin(seed) * 10000;
-    return x - Math.floor(x);
+const buildImageAlt = (caption: CaptionRow) => {
+  const text = (caption.content ?? "Caption").trim();
+  if (!text) return "Image for caption";
+  if (text.length <= 90) return `Image for caption: ${text}`;
+  return `Image for caption: ${text.slice(0, 87)}...`;
+};
+
+const relativeTime = (value: string | null) => {
+  if (!value) return "unknown";
+  const diffMs = Date.now() - new Date(value).getTime();
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  if (hours < 1) return "just now";
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+};
+
+const getCreatedTime = (caption: CaptionRow) =>
+  new Date(caption.created_datetime_utc ?? 0).getTime();
+
+const getImageGroupKey = (caption: CaptionRow) => caption.image_id ?? `caption-${caption.id}`;
+
+const diversifyByImage = (
+  rows: CaptionRow[],
+  rankValue: (caption: CaptionRow) => number
+) => {
+  const buckets = new Map<string, CaptionRow[]>();
+
+  rows.forEach((caption) => {
+    const key = getImageGroupKey(caption);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key)!.push(caption);
+  });
+
+  const sortedBuckets = Array.from(buckets.values()).map((bucket) =>
+    [...bucket].sort((a, b) => rankValue(b) - rankValue(a))
+  );
+
+  sortedBuckets.sort((a, b) => rankValue(b[0]) - rankValue(a[0]));
+
+  const mixed: CaptionRow[] = [];
+  let addedInPass = true;
+  while (addedInPass) {
+    addedInPass = false;
+    for (const bucket of sortedBuckets) {
+      const next = bucket.shift();
+      if (!next) continue;
+      mixed.push(next);
+      addedInPass = true;
+    }
+  }
+
+  return mixed;
 };
 
 export default function Home() {
-    const [rows, setRows] = useState<TermRow[]>([]);
-    const [types, setTypes] = useState<TermTypeRow[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(Boolean(supabase));
+  const [error, setError] = useState<string | null>(
+    supabase ? null : missingSupabaseError
+  );
+  const [profileId, setProfileId] = useState<string | null>(null);
+  const [captions, setCaptions] = useState<CaptionRow[]>([]);
+  const [rankScoreByCaption, setRankScoreByCaption] = useState<Record<string, number>>({});
+  const [myVotes, setMyVotes] = useState<Record<string, number>>({});
+  const [submittingCaptionId, setSubmittingCaptionId] = useState<string | null>(null);
+  const [brokenImages, setBrokenImages] = useState<Record<string, true>>({});
+  const [viewMode, setViewMode] = useState<"stage" | "wall">(() => {
+    const stored = readStoredPrefs();
+    return stored?.viewMode === "wall" ? "wall" : "stage";
+  });
+  const [sortMode, setSortMode] = useState<"top" | "new">(() => {
+    const stored = readStoredPrefs();
+    return stored?.sortMode === "new" ? "new" : "top";
+  });
+  const [activeCaptionId, setActiveCaptionId] = useState<string | null>(null);
+  const [loadedCount, setLoadedCount] = useState(LOAD_BATCH_SIZE);
+  const [showShortcuts, setShowShortcuts] = useState(() => {
+    const stored = readStoredPrefs();
+    return Boolean(stored?.showShortcuts);
+  });
+  const [showOptions, setShowOptions] = useState(false);
+  const [focusMode, setFocusMode] = useState(() => {
+    const stored = readStoredPrefs();
+    return Boolean(stored?.focusMode);
+  });
+  const [stageTransitioning, setStageTransitioning] = useState(false);
+  const [undoState, setUndoState] = useState<UndoState | null>(null);
+  const [reactionPulseCaptionId, setReactionPulseCaptionId] = useState<string | null>(null);
+  const stageSwapTimerRef = useRef<number | null>(null);
+  const stageFadeTimerRef = useRef<number | null>(null);
+  const undoTimerRef = useRef<number | null>(null);
+  const reactionPulseTimerRef = useRef<number | null>(null);
 
-    useEffect(() => {
-        if (!supabase) {
-            setError("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY.");
-            setLoading(false);
-            return;
+  useEffect(() => {
+    window.localStorage.setItem(
+      "caption-studio-prefs",
+      JSON.stringify({ viewMode, sortMode, showShortcuts, focusMode })
+    );
+  }, [focusMode, showShortcuts, sortMode, viewMode]);
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    const load = async () => {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const session = sessionData.session;
+      if (!session) {
+        window.location.assign("/login");
+        return;
+      }
+
+      setProfileId(session.user.id);
+
+      const { data: captionData, error: captionError } = await supabase
+        .from("captions")
+        .select(
+          "id, content, image_id, profile_id, like_count, created_datetime_utc, images(url)"
+        )
+        .order("created_datetime_utc", { ascending: false })
+        .limit(loadedCount);
+
+      if (captionError) {
+        setError(captionError.message);
+        setLoading(false);
+        return;
+      }
+
+      const safeCaptions = (captionData ?? []) as CaptionRow[];
+      setCaptions(safeCaptions);
+      setActiveCaptionId((prev) => {
+        if (prev && safeCaptions.some((caption) => caption.id === prev)) return prev;
+        return safeCaptions[0]?.id ?? null;
+      });
+
+      if (safeCaptions.length === 0) {
+        setLoading(false);
+        return;
+      }
+
+      const captionIds = safeCaptions.map((c) => c.id);
+      const { data: voteRows, error: voteError } = await supabase
+        .from("caption_votes")
+        .select("id, caption_id, profile_id, vote_value")
+        .in("caption_id", captionIds);
+
+      if (voteError) {
+        setError(voteError.message);
+        setLoading(false);
+        return;
+      }
+
+      const totals: Record<string, number> = {};
+      const mine: Record<string, number> = {};
+
+      (voteRows as VoteRow[] | null)?.forEach((vote) => {
+        totals[vote.caption_id] = (totals[vote.caption_id] ?? 0) + vote.vote_value;
+        if (vote.profile_id === session.user.id) {
+          mine[vote.caption_id] = vote.vote_value;
         }
+      });
 
-        (async () => {
-            const { data: sessionData } = await supabase.auth.getSession();
-            if (!sessionData.session) {
-                window.location.href = "/login";
-                return;
-            }
+      setRankScoreByCaption(totals);
+      setMyVotes(mine);
+      setLoading(false);
+    };
 
-            const { data, error } = await supabase
-                .from("terms")
-                .select(
-                    "id, term, definition, example, priority, term_type_id, modified_datetime_utc"
-                )
-                .order("priority", { ascending: false, nullsFirst: false })
-                .limit(90);
+    void load();
+  }, [loadedCount]);
 
-            const { data: typeData, error: typeError } = await supabase
-                .from("term_types")
-                .select("id, name")
-                .order("id");
-
-            if (error) {
-                setError(error.message);
-            } else if (typeError) {
-                setError(typeError.message);
-            } else {
-                setRows((data ?? []) as TermRow[]);
-                setTypes((typeData ?? []) as TermTypeRow[]);
-            }
-
-            setLoading(false);
-        })();
-    }, []);
-
-    const clusters = useMemo(() => {
-        const typeMap = new Map<number, string>();
-        types.forEach((t) => typeMap.set(t.id, t.name));
-
-        const buckets = new Map<number, TermRow[]>();
-        rows.forEach((row) => {
-            const key = row.term_type_id ?? -1;
-            if (!buckets.has(key)) buckets.set(key, []);
-            buckets.get(key)!.push(row);
-        });
-
-        return Array.from(buckets.entries()).map(([typeId, list], index) => ({
-            typeId,
-            name: typeMap.get(typeId) ?? "Unclassified",
-            list,
-            index,
-        }));
-    }, [rows, types]);
-
-    const layout = useMemo(() => {
-        const stopwords = new Set([
-            "a",
-            "an",
-            "and",
-            "are",
-            "as",
-            "at",
-            "be",
-            "but",
-            "by",
-            "for",
-            "from",
-            "has",
-            "have",
-            "in",
-            "is",
-            "it",
-            "its",
-            "of",
-            "on",
-            "or",
-            "that",
-            "the",
-            "to",
-            "was",
-            "were",
-            "with",
-        ]);
-
-        const tokenize = (text: string) =>
-            text
-                .toLowerCase()
-                .replace(/[^a-z0-9\s]/g, " ")
-                .split(/\s+/)
-                .filter((word) => word.length > 2 && !stopwords.has(word));
-
-        const buildTfidf = (docs: string[]) => {
-            const tf = docs.map((doc) => {
-                const counts = new Map<string, number>();
-                tokenize(doc).forEach((word) => {
-                    counts.set(word, (counts.get(word) ?? 0) + 1);
-                });
-                return counts;
-            });
-
-            const df = new Map<string, number>();
-            tf.forEach((counts) => {
-                counts.forEach((_count, word) => {
-                    df.set(word, (df.get(word) ?? 0) + 1);
-                });
-            });
-
-            const idf = new Map<string, number>();
-            df.forEach((count, word) => {
-                idf.set(word, Math.log((1 + docs.length) / (1 + count)) + 1);
-            });
-
-            return tf.map((counts) => {
-                const vec = new Map<string, number>();
-                counts.forEach((count, word) => {
-                    const weight = count * (idf.get(word) ?? 1);
-                    vec.set(word, weight);
-                });
-                return vec;
-            });
-        };
-
-        const cosine = (a: Map<string, number>, b: Map<string, number>) => {
-            let dot = 0;
-            let na = 0;
-            let nb = 0;
-            a.forEach((va, key) => {
-                na += va * va;
-                const vb = b.get(key);
-                if (vb) dot += va * vb;
-            });
-            b.forEach((vb) => {
-                nb += vb * vb;
-            });
-            if (na === 0 || nb === 0) return 0;
-            return dot / Math.sqrt(na * nb);
-        };
-
-        const forceLayout = (terms: TermRow[], seedBase: number) => {
-            const n = terms.length;
-            if (n === 0) return [];
-            const docs = terms.map(
-                (t) => `${t.term} ${t.definition ?? ""} ${t.example ?? ""}`
-            );
-            const vectors = buildTfidf(docs);
-            const sim = Array.from({ length: n }, () => Array(n).fill(0));
-            for (let i = 0; i < n; i += 1) {
-                for (let j = i + 1; j < n; j += 1) {
-                    const value = cosine(vectors[i], vectors[j]);
-                    sim[i][j] = value;
-                    sim[j][i] = value;
-                }
-            }
-
-            const positions = terms.map((term, idx) => {
-                const angle = seeded(term.id + seedBase) * Math.PI * 2;
-                const r = 4 + seeded(seedBase + idx * 7) * 7;
-                return {
-                    x: Math.cos(angle) * r,
-                    y: Math.sin(angle) * r,
-                };
-            });
-
-            const repulsion = 18;
-            const attraction = 0.06;
-            const damping = 0.55;
-            const iterations = 80;
-
-            for (let iter = 0; iter < iterations; iter += 1) {
-                const disp = positions.map(() => ({ x: 0, y: 0 }));
-                for (let i = 0; i < n; i += 1) {
-                    for (let j = i + 1; j < n; j += 1) {
-                        const dx = positions[i].x - positions[j].x;
-                        const dy = positions[i].y - positions[j].y;
-                        const dist = Math.max(0.6, Math.sqrt(dx * dx + dy * dy));
-                        const force = repulsion / (dist * dist);
-                        const fx = (dx / dist) * force;
-                        const fy = (dy / dist) * force;
-                        disp[i].x += fx;
-                        disp[i].y += fy;
-                        disp[j].x -= fx;
-                        disp[j].y -= fy;
-                    }
-                }
-
-                for (let i = 0; i < n; i += 1) {
-                    for (let j = i + 1; j < n; j += 1) {
-                        const weight = sim[i][j];
-                        if (weight < 0.08) continue;
-                        const dx = positions[i].x - positions[j].x;
-                        const dy = positions[i].y - positions[j].y;
-                        const dist = Math.max(0.6, Math.sqrt(dx * dx + dy * dy));
-                        const target = 3.5 + (1 - weight) * 5.5;
-                        const force = (dist - target) * attraction * weight;
-                        const fx = (dx / dist) * force;
-                        const fy = (dy / dist) * force;
-                        disp[i].x -= fx;
-                        disp[i].y -= fy;
-                        disp[j].x += fx;
-                        disp[j].y += fy;
-                    }
-                }
-
-                for (let i = 0; i < n; i += 1) {
-                    const jitter = (seeded(i + iter + seedBase) - 0.5) * 0.12;
-                    positions[i].x += disp[i].x * damping + jitter;
-                    positions[i].y += disp[i].y * damping - jitter;
-                }
-            }
-
-            return positions;
-        };
-
-        const count = Math.max(clusters.length, 1);
-        const radiusX = 30;
-        const radiusY = 22;
-        return clusters.map((cluster, idx) => {
-            const angle = (Math.PI * 2 * idx) / count - Math.PI / 2;
-            const jitter = (seeded(idx + cluster.list.length) - 0.5) * 6;
-            const cx = 50 + Math.cos(angle) * radiusX + jitter;
-            const cy = 52 + Math.sin(angle) * radiusY + jitter;
-            const terms = cluster.list.slice(0, 14);
-            const offsets = forceLayout(terms, idx * 23);
-            const maxDist =
-                offsets.reduce((max, p) => Math.max(max, Math.hypot(p.x, p.y)), 0) || 1;
-            const clusterRadius = 9 + Math.min(8, terms.length * 0.5);
-            const scale = clusterRadius / maxDist;
-            const xScale = 1.15 + (seeded(idx * 11) - 0.5) * 0.2;
-            const yScale = 0.9 + (seeded(idx * 17) - 0.5) * 0.2;
-            const nodes = terms.map((term, tIdx) => {
-                const jitter = (seeded(term.id + idx * 31) - 0.5) * 1.6;
-                return {
-                    term,
-                    x: cx + offsets[tIdx].x * scale * xScale + jitter,
-                    y: cy + offsets[tIdx].y * scale * yScale - jitter,
-                };
-            });
-            return { cluster, center: { x: cx, y: cy }, nodes };
-        });
-    }, [clusters]);
-
-    if (loading) {
-        return (
-            <main className="min-h-screen p-8 bg-slate-950 text-slate-100">
-                <div className="text-slate-300 text-sm">Loading terms...</div>
-            </main>
-        );
+  const sortedCaptions = useMemo(() => {
+    const list = [...captions];
+    if (sortMode === "new") {
+      return diversifyByImage(list, (caption) => getCreatedTime(caption));
     }
 
-    if (error) {
-        return (
-            <main className="min-h-screen p-8 bg-slate-950 text-slate-100">
-                <h1 className="text-2xl font-semibold">Terms</h1>
-                <p className="mt-4 text-red-400">Error: {error}</p>
-                <p className="mt-2 text-slate-400">
-                    Double-check your table name and env vars.
-                </p>
-            </main>
-        );
+    return diversifyByImage(
+      list,
+      (caption) => (rankScoreByCaption[caption.id] ?? 0) * 10000000000000 + getCreatedTime(caption)
+    );
+  }, [captions, rankScoreByCaption, sortMode]);
+
+  const activeIndex = useMemo(() => {
+    if (!activeCaptionId) return 0;
+    const idx = sortedCaptions.findIndex((c) => c.id === activeCaptionId);
+    return idx >= 0 ? idx : 0;
+  }, [activeCaptionId, sortedCaptions]);
+
+  const activeCaption = sortedCaptions[activeIndex] ?? null;
+
+  const focusCaption = useCallback(
+    (nextCaptionId: string) => {
+      if (nextCaptionId === activeCaptionId) return;
+      if (viewMode !== "stage") {
+        setActiveCaptionId(nextCaptionId);
+        return;
+      }
+
+      if (stageSwapTimerRef.current) window.clearTimeout(stageSwapTimerRef.current);
+      if (stageFadeTimerRef.current) window.clearTimeout(stageFadeTimerRef.current);
+
+      setStageTransitioning(true);
+      stageSwapTimerRef.current = window.setTimeout(() => {
+        setActiveCaptionId(nextCaptionId);
+        stageFadeTimerRef.current = window.setTimeout(() => {
+          setStageTransitioning(false);
+        }, 170);
+      }, 120);
+    },
+    [activeCaptionId, viewMode]
+  );
+
+  const queueCaptions = useMemo(() => {
+    if (sortedCaptions.length <= 1) return [];
+    const next: CaptionRow[] = [];
+    for (let i = 1; i <= Math.min(4, sortedCaptions.length - 1); i += 1) {
+      const idx = (activeIndex + i) % sortedCaptions.length;
+      next.push(sortedCaptions[idx]);
+    }
+    return next;
+  }, [activeIndex, sortedCaptions]);
+
+  const moveActive = useCallback(
+    (direction: 1 | -1) => {
+      if (sortedCaptions.length === 0) return;
+      const nextIndex =
+        (activeIndex + direction + sortedCaptions.length) % sortedCaptions.length;
+      focusCaption(sortedCaptions[nextIndex].id);
+    },
+    [activeIndex, focusCaption, sortedCaptions]
+  );
+
+  const pickRandom = useCallback(() => {
+    if (sortedCaptions.length === 0) return;
+    const idx = Math.floor(Math.random() * sortedCaptions.length);
+    focusCaption(sortedCaptions[idx].id);
+  }, [focusCaption, sortedCaptions]);
+
+  useEffect(() => {
+    return () => {
+      if (stageSwapTimerRef.current) window.clearTimeout(stageSwapTimerRef.current);
+      if (stageFadeTimerRef.current) window.clearTimeout(stageFadeTimerRef.current);
+      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+      if (reactionPulseTimerRef.current) {
+        window.clearTimeout(reactionPulseTimerRef.current);
+      }
+    };
+  }, []);
+
+  const submitVote = useCallback(
+    async (captionId: string, voteValue: 1 | -1, advanceToNext = false) => {
+      if (!supabase || !profileId) {
+        window.location.assign("/login");
+        return;
+      }
+
+      const shouldAdvance =
+        advanceToNext && captionId === activeCaptionId && sortedCaptions.length > 1;
+      const nextCaptionId = shouldAdvance
+        ? sortedCaptions[(activeIndex + 1) % sortedCaptions.length].id
+        : null;
+
+      setError(null);
+      setSubmittingCaptionId(captionId);
+
+      const { data: existingRows, error: existingError } = await supabase
+        .from("caption_votes")
+        .select("id, vote_value, created_datetime_utc")
+        .eq("caption_id", captionId)
+        .eq("profile_id", profileId)
+        .order("created_datetime_utc", { ascending: false })
+        .limit(1);
+
+      if (existingError) {
+        setError(existingError.message);
+        setSubmittingCaptionId(null);
+        return;
+      }
+
+      const existingVote = (existingRows as VoteRow[] | null)?.[0] ?? null;
+      const previousVote = (existingVote?.vote_value ?? 0) as 1 | -1 | 0;
+      let changed = false;
+
+      if (!existingVote) {
+        const now = new Date().toISOString();
+        const { error: insertError } = await supabase.from("caption_votes").insert({
+          caption_id: captionId,
+          profile_id: profileId,
+          vote_value: voteValue,
+          created_datetime_utc: now,
+          modified_datetime_utc: now,
+        });
+
+        if (insertError) {
+          setError(insertError.message);
+          setSubmittingCaptionId(null);
+          return;
+        }
+        changed = true;
+      } else if (existingVote.vote_value !== voteValue) {
+        const { error: updateError } = await supabase
+          .from("caption_votes")
+          .update({ vote_value: voteValue, modified_datetime_utc: new Date().toISOString() })
+          .eq("id", existingVote.id);
+
+        if (updateError) {
+          setError(updateError.message);
+          setSubmittingCaptionId(null);
+          return;
+        }
+        changed = true;
+      }
+
+      setMyVotes((prev) => ({ ...prev, [captionId]: voteValue }));
+      if (changed) {
+        setUndoState({ captionId, previousVote });
+        if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+        undoTimerRef.current = window.setTimeout(() => {
+          setUndoState(null);
+        }, 5000);
+        setReactionPulseCaptionId(captionId);
+        if (reactionPulseTimerRef.current) {
+          window.clearTimeout(reactionPulseTimerRef.current);
+        }
+        reactionPulseTimerRef.current = window.setTimeout(() => {
+          setReactionPulseCaptionId(null);
+        }, 650);
+      }
+      setSubmittingCaptionId(null);
+      if (nextCaptionId) focusCaption(nextCaptionId);
+    },
+    [activeCaptionId, activeIndex, focusCaption, profileId, sortedCaptions]
+  );
+
+  const undoLastReaction = useCallback(async () => {
+    if (!supabase || !profileId || !undoState) return;
+
+    const { captionId, previousVote } = undoState;
+    setUndoState(null);
+    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+
+    const { data: existingRows, error: existingError } = await supabase
+      .from("caption_votes")
+      .select("id, vote_value, created_datetime_utc")
+      .eq("caption_id", captionId)
+      .eq("profile_id", profileId)
+      .order("created_datetime_utc", { ascending: false })
+      .limit(1);
+
+    if (existingError) {
+      setError(existingError.message);
+      return;
+    }
+
+    const current = (existingRows as VoteRow[] | null)?.[0] ?? null;
+
+    if (previousVote === 0) {
+      if (current) {
+        const { error: deleteError } = await supabase
+          .from("caption_votes")
+          .delete()
+          .eq("id", current.id);
+        if (deleteError) {
+          setError(deleteError.message);
+          return;
+        }
+      }
+      setMyVotes((prev) => {
+        const next = { ...prev };
+        delete next[captionId];
+        return next;
+      });
+      return;
+    }
+
+    if (current) {
+      const { error: updateError } = await supabase
+        .from("caption_votes")
+        .update({
+          vote_value: previousVote,
+          modified_datetime_utc: new Date().toISOString(),
+        })
+        .eq("id", current.id);
+
+      if (updateError) {
+        setError(updateError.message);
+        return;
+      }
+    } else {
+      const now = new Date().toISOString();
+      const { error: insertError } = await supabase.from("caption_votes").insert({
+        caption_id: captionId,
+        profile_id: profileId,
+        vote_value: previousVote,
+        created_datetime_utc: now,
+        modified_datetime_utc: now,
+      });
+      if (insertError) {
+        setError(insertError.message);
+        return;
+      }
+    }
+
+    setMyVotes((prev) => ({ ...prev, [captionId]: previousVote }));
+  }, [profileId, undoState]);
+
+  useEffect(() => {
+    const isTypingTarget = (target: EventTarget | null) => {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName.toLowerCase();
+      return (
+        target.isContentEditable || tag === "input" || tag === "textarea" || tag === "select"
+      );
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isTypingTarget(event.target)) return;
+      if (event.key === "?") {
+        event.preventDefault();
+        setShowShortcuts((prev) => !prev);
+        return;
+      }
+
+      if (viewMode !== "stage" || !activeCaption) return;
+
+      const key = event.key.toLowerCase();
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        moveActive(1);
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        moveActive(-1);
+      } else if (key === "l") {
+        event.preventDefault();
+        void submitVote(activeCaption.id, 1, true);
+      } else if (key === "d") {
+        event.preventDefault();
+        void submitVote(activeCaption.id, -1, true);
+      } else if (key === "r") {
+        event.preventDefault();
+        pickRandom();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeCaption, moveActive, pickRandom, submitVote, viewMode]);
+
+  const renderImagePanel = (caption: CaptionRow, variant: ImageVariant) => {
+    const imageUrl = caption.images?.url;
+    const hasWorkingImage = Boolean(imageUrl) && !brokenImages[caption.id];
+
+    const sizeClass =
+      variant === "stage"
+        ? "h-[54vh] min-h-[320px] max-h-[640px]"
+        : variant === "thumb"
+          ? "h-full"
+          : "h-64";
+
+    if (hasWorkingImage) {
+      return (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={imageUrl ?? ""}
+          alt={buildImageAlt(caption)}
+          loading="lazy"
+          className={`w-full ${sizeClass} bg-[#050a18] object-contain transition duration-500 group-hover:scale-[1.01]`}
+          onError={() => {
+            setBrokenImages((prev) => ({ ...prev, [caption.id]: true }));
+          }}
+        />
+      );
     }
 
     return (
-        <main className="min-h-screen bg-slate-950 text-slate-100">
-            <div className="relative overflow-hidden">
-                <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.2),transparent_55%),radial-gradient(circle_at_80%_15%,rgba(251,191,36,0.24),transparent_45%),radial-gradient(circle_at_10%_85%,rgba(14,116,144,0.24),transparent_50%)]" />
-                <div className="absolute inset-0 opacity-40 bg-[linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:64px_64px]" />
+      <div
+        className={`flex w-full ${sizeClass} flex-col items-center justify-center gap-2 bg-[linear-gradient(145deg,#1b2338,#0b1326)] p-6 text-center`}
+      >
+        <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-black/25 text-slate-200">
+          <span aria-hidden="true">◌</span>
+        </div>
+        <p className="text-sm text-slate-200">Image unavailable</p>
+        <p className="text-[11px] text-slate-400">This caption still works without media.</p>
+        {imageUrl && (
+          <a
+            href={imageUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="rounded-md border border-cyan-300/40 px-3 py-1 text-xs text-cyan-200 hover:bg-cyan-400/10"
+          >
+            Open image URL
+          </a>
+        )}
+      </div>
+    );
+  };
 
-                <div className="relative mx-auto max-w-6xl px-6 py-12">
-                    <div className="flex flex-col gap-8 lg:flex-row lg:items-end lg:justify-between">
-                        <div className="space-y-4">
-                            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-[0.6rem] uppercase tracking-[0.4em] text-slate-300">
-                                Atlas Mode
-                                <span className="h-1.5 w-1.5 rounded-full bg-amber-300 shadow-[0_0_12px_rgba(251,191,36,0.8)]" />
-                            </span>
-                            <h1 className="text-5xl font-semibold tracking-tight text-slate-50 md:text-6xl">
-                                Cultural Term Atlas
-                            </h1>
-                                <p className="max-w-xl text-sm text-slate-300">
-                                    A living star map of slang. Terms orbit their grammatical anchors,
-                                    while positions inside each cluster are shaped by textual similarity.
-                                </p>
-                            <div className="flex flex-wrap gap-3 text-xs uppercase tracking-[0.3em] text-slate-400">
-                                <span className="rounded-full border border-white/10 bg-white/5 px-4 py-2">
-                                    {rows.length} entries
-                                </span>
-                                <span className="rounded-full border border-white/10 bg-white/5 px-4 py-2">
-                                    {clusters.length} constellations
-                                </span>
-                            </div>
-                        </div>
+  useEffect(() => {
+    if (viewMode !== "stage") return;
+    const nextImageUrl = queueCaptions[0]?.images?.url;
+    if (!nextImageUrl) return;
+    const img = new Image();
+    img.src = nextImageUrl;
+  }, [queueCaptions, viewMode]);
 
-                        <div className="flex items-center gap-4 text-sm text-slate-300">
-                            <button
-                                onClick={async () => {
-                                    if (!supabase) return;
-                                    await supabase.auth.signOut();
-                                    window.location.href = "/login";
-                                }}
-                                className="rounded-full border border-white/10 px-5 py-2 text-slate-100 hover:bg-white/10"
-                            >
-                                Sign out
-                            </button>
-                            <div className="rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3 text-xs text-slate-300">
-                                Focus:{" "}
-                                <span className="text-slate-100">
-                                    {clusters[0]?.name ?? "Unclassified"}
-                                </span>
-                            </div>
-                        </div>
-                    </div>
+  if (loading) {
+    return (
+      <main className="min-h-screen bg-[#080f22] p-8 text-slate-100">
+        <p className="text-sm text-slate-300">Loading captions...</p>
+      </main>
+    );
+  }
 
-                    <div className="mt-10 grid gap-6 lg:grid-cols-[1fr_280px]">
-                        <div className="atlas-field relative h-[72vh] overflow-hidden rounded-[32px] border border-white/10 bg-slate-900/50 p-6">
-                            <div className="absolute inset-0 rounded-[32px] bg-[radial-gradient(circle_at_center,rgba(148,163,184,0.12),transparent_60%)]" />
-                            <div className="absolute -inset-[1px] rounded-[32px] bg-gradient-to-br from-white/10 via-transparent to-white/5 opacity-60" />
+  const modeTitle = viewMode === "stage" ? "Stage And Queue" : "Poster Wall";
+  const modeDescription =
+    viewMode === "stage"
+      ? "One active caption on stage. A live queue to the side. React with Like or Dislike and keep the show moving."
+      : "A stylized board of caption posters. React directly here or send any card to Stage mode.";
+  const accentPrimary =
+    viewMode === "stage"
+      ? "border-emerald-300/40 bg-emerald-400/12 text-emerald-100"
+      : "border-cyan-300/40 bg-cyan-400/12 text-cyan-100";
 
-                            <svg className="absolute inset-0 h-full w-full">
-                                {layout.flatMap((item) =>
-                                    item.nodes.map((node) => (
-                                        <line
-                                            key={`${item.cluster.typeId}-${node.term.id}`}
-                                            x1={`${item.center.x}%`}
-                                            y1={`${item.center.y}%`}
-                                            x2={`${node.x}%`}
-                                            y2={`${node.y}%`}
-                                            stroke="rgba(148,163,184,0.24)"
-                                            strokeWidth="1"
-                                        />
-                                    ))
-                                )}
-                            </svg>
+  return (
+    <main className="min-h-screen bg-[#080f22] text-slate-100">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_7%_15%,rgba(251,191,36,0.16),transparent_36%),radial-gradient(circle_at_88%_8%,rgba(16,185,129,0.15),transparent_35%),radial-gradient(circle_at_50%_92%,rgba(56,189,248,0.16),transparent_40%)]" />
+      <div className="pointer-events-none absolute inset-0 opacity-35 bg-[linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:52px_52px]" />
 
-                            {layout.map((item, index) => (
-                                <div key={`cluster-${item.cluster.typeId}`} className="contents">
-                                    <div
-                                        className={`pointer-events-none absolute z-30 rounded-full border border-white/30 bg-gradient-to-br ${palette[index % palette.length]} px-4 py-2 text-[0.65rem] uppercase tracking-[0.25em] text-white shadow-[0_10px_30px_rgba(15,23,42,0.45)] ring-1 ring-black/20 backdrop-blur`}
-                                        style={{
-                                            left: `${item.center.x}%`,
-                                            top: `${item.center.y}%`,
-                                            transform: "translate(-50%, -50%)",
-                                        }}
-                                    >
-                                        {item.cluster.name}
-                                    </div>
-
-                                    {item.nodes.map((node, nodeIndex) => (
-                                        <div
-                                            key={`node-${node.term.id}`}
-                                            className="atlas-node group absolute z-10"
-                                            style={{
-                                                left: `${node.x}%`,
-                                                top: `${node.y}%`,
-                                                transform: "translate(-50%, -50%)",
-                                                animationDelay: `${(nodeIndex % 6) * 0.35}s`,
-                                            }}
-                                        >
-                                            <div className="relative atlas-dot">
-                                                <span className="absolute inset-0 rounded-full bg-white/40 blur-md animate-atlas-glow" />
-                                                <span className="block h-3.5 w-3.5 rounded-full bg-white shadow-[0_0_16px_rgba(255,255,255,0.65)] animate-atlas-pulse" />
-                                            </div>
-                                            <div className="atlas-tooltip pointer-events-none absolute bottom-6 left-1/2 top-auto z-40 w-60 -translate-x-1/2 rounded-2xl border border-white/10 bg-slate-950/95 p-4 text-xs text-slate-100 opacity-0 shadow-[0_20px_50px_rgba(15,23,42,0.6)] backdrop-blur transition group-hover:opacity-100">
-                                                <p className="text-sm font-semibold text-slate-100">
-                                                    {node.term.term}
-                                                </p>
-                                                <p className="mt-2 text-slate-300">
-                                                    {node.term.definition
-                                                        ? truncate(node.term.definition, 140)
-                                                        : "No definition yet."}
-                                                </p>
-                                                {node.term.example && (
-                                                    <p className="mt-2 text-[0.7rem] text-slate-400">
-                                                        “{truncate(node.term.example, 90)}”
-                                                    </p>
-                                                )}
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            ))}
-                        </div>
-
-                        <div className="space-y-4">
-                            <div className="rounded-[24px] border border-white/10 bg-slate-900/60 p-5">
-                                <h2 className="text-xs uppercase tracking-[0.3em] text-slate-400">
-                                    Constellation Index
-                                </h2>
-                                <div className="mt-4 space-y-3">
-                                    {clusters.map((cluster, index) => (
-                                        <div
-                                            key={`legend-${cluster.typeId}`}
-                                            className="rounded-2xl border border-white/10 bg-slate-950/50 p-3"
-                                        >
-                                            <div className="flex items-center justify-between">
-                                                <div className="flex items-center gap-3">
-                                                    <span
-                                                        className={`h-3 w-3 rounded-full bg-gradient-to-br ${palette[index % palette.length]}`}
-                                                    />
-                                                    <span className="text-sm text-slate-200">
-                                                        {cluster.name}
-                                                    </span>
-                                                </div>
-                                                <span className="text-xs text-slate-400">
-                                                    {cluster.list.length}
-                                                </span>
-                                            </div>
-                                            <p className="mt-2 text-xs text-slate-400">
-                                                Sample:{" "}
-                                                {cluster.list[0]?.term ?? "No terms yet"}
-                                            </p>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                            <div className="rounded-[24px] border border-white/10 bg-gradient-to-br from-slate-900/70 via-slate-950/70 to-slate-900/70 p-5 text-xs text-slate-300">
-                                <p className="text-[0.7rem] uppercase tracking-[0.3em] text-slate-400">
-                                    Atlas Note
-                                </p>
-                                <p className="mt-3">
-                                    Cluster layout is driven by{" "}
-                                    <code className="font-mono">term_type_id</code>. Add new types
-                                    to expand the map and create new constellations.
-                                </p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+      <div className="relative mx-auto max-w-7xl px-4 py-8 sm:px-8">
+        <header
+          className={`relative z-30 mb-8 rounded-[30px] border bg-[#0f1a37]/70 p-6 backdrop-blur-xl ${
+            focusMode ? "border-white/5 opacity-80" : "border-white/10"
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <p className="text-[0.65rem] uppercase tracking-[0.45em] text-emerald-200/80">
+                Caption Studio
+              </p>
+              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-slate-50 sm:text-5xl title-display">
+                {modeTitle}
+              </h1>
+              <p className="mt-3 max-w-2xl text-sm leading-relaxed text-slate-300">
+                {modeDescription}
+              </p>
             </div>
 
-            <style jsx global>{`
-                @import url("https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+            <div className="relative flex items-center gap-3">
+              <div className={`rounded-full border px-4 py-2 text-xs uppercase tracking-[0.2em] ${accentPrimary}`}>
+                {sortedCaptions.length} loaded
+              </div>
+              <button
+                onClick={() => setLoadedCount((prev) => prev + LOAD_BATCH_SIZE)}
+                className="rounded-full border border-cyan-200/35 bg-cyan-400/10 px-4 py-2 text-xs uppercase tracking-[0.18em] text-cyan-100 transition hover:bg-cyan-400/20"
+              >
+                Load {LOAD_BATCH_SIZE} More
+              </button>
+              <button
+                onClick={() => setShowOptions((prev) => !prev)}
+                className="rounded-full border border-white/20 bg-black/25 px-4 py-2 text-xs uppercase tracking-[0.18em] text-slate-200 transition hover:bg-white/10"
+              >
+                Options
+              </button>
+              <button
+                onClick={async () => {
+                  if (!supabase) return;
+                  await supabase.auth.signOut();
+                  window.location.assign("/login");
+                }}
+                className="rounded-full border border-white/20 bg-slate-950/70 px-5 py-2.5 text-sm text-slate-100 transition hover:bg-slate-900"
+              >
+                Sign out
+              </button>
 
-                body {
-                    font-family: "Space Grotesk", "Sora", sans-serif;
-                }
+              {showOptions && (
+                <div className="absolute right-0 top-12 z-[120] w-64 rounded-2xl border border-white/15 bg-[#0a1229]/95 p-3 text-xs shadow-[0_20px_45px_rgba(2,6,23,0.55)] backdrop-blur">
+                  <button
+                    onClick={() => setShowShortcuts((prev) => !prev)}
+                    className="mb-2 w-full rounded-xl border border-violet-200/30 px-3 py-2 text-left text-violet-100 hover:bg-violet-400/10"
+                  >
+                    {showShortcuts ? "Hide" : "Show"} shortcuts
+                  </button>
+                  <button
+                    onClick={() => setFocusMode((prev) => !prev)}
+                    className="mb-2 w-full rounded-xl border border-slate-200/20 px-3 py-2 text-left text-slate-200 hover:bg-white/10"
+                  >
+                    {focusMode ? "Disable" : "Enable"} focus mode
+                  </button>
+                  <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-[11px] uppercase tracking-[0.16em] text-slate-300">
+                    {sortMode === "top" ? "Top (de-clumped)" : "New (de-clumped)"}
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
 
-                h1,
-                h2 {
-                    font-family: "Fraunces", "Times New Roman", serif;
-                }
+          <div className={`mt-5 flex flex-wrap items-center gap-3 text-xs ${focusMode ? "opacity-60" : ""}`}>
+            <div className="inline-flex rounded-full border border-white/15 bg-black/20 p-1">
+              <button
+                onClick={() => setViewMode("stage")}
+                className={`rounded-full px-4 py-1.5 ${
+                  viewMode === "stage" ? "bg-emerald-300/20 text-emerald-100" : "text-slate-300"
+                }`}
+              >
+                Stage
+              </button>
+              <button
+                onClick={() => setViewMode("wall")}
+                className={`rounded-full px-4 py-1.5 ${
+                  viewMode === "wall" ? "bg-emerald-300/20 text-emerald-100" : "text-slate-300"
+                }`}
+              >
+                Wall
+              </button>
+            </div>
 
-                @keyframes atlasPulse {
-                    0%,
-                    100% {
-                        transform: scale(1);
-                        opacity: 0.8;
-                    }
-                    50% {
-                        transform: scale(1.35);
-                        opacity: 1;
-                    }
-                }
+            <div className="inline-flex rounded-full border border-white/15 bg-black/20 p-1">
+              <button
+                onClick={() => setSortMode("top")}
+                className={`rounded-full px-4 py-1.5 ${
+                  sortMode === "top" ? "bg-sky-300/20 text-sky-100" : "text-slate-300"
+                }`}
+              >
+                Top
+              </button>
+              <button
+                onClick={() => setSortMode("new")}
+                className={`rounded-full px-4 py-1.5 ${
+                  sortMode === "new" ? "bg-sky-300/20 text-sky-100" : "text-slate-300"
+                }`}
+              >
+                New
+              </button>
+            </div>
 
-                @keyframes atlasGlow {
-                    0%,
-                    100% {
-                        opacity: 0.2;
-                        transform: scale(1);
-                    }
-                    50% {
-                        opacity: 0.6;
-                        transform: scale(1.8);
-                    }
-                }
+            <button
+              onClick={pickRandom}
+              className="rounded-full border border-amber-200/35 px-4 py-2 text-amber-100 hover:bg-amber-400/10"
+            >
+              Surprise Me
+            </button>
+            <span className="rounded-full border border-white/15 bg-white/5 px-4 py-2 uppercase tracking-[0.2em] text-slate-300">
+              {viewMode === "stage" ? "Stage nav: ← →" : "Wall browse"}
+            </span>
+          </div>
+        </header>
 
-                .animate-atlas-pulse {
-                    animation: atlasPulse 3.2s ease-in-out infinite;
-                }
+        {error && (
+          <p
+            aria-live="polite"
+            className="mb-5 rounded-xl border border-rose-300/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200"
+          >
+            Error: {error}
+          </p>
+        )}
 
-                .animate-atlas-glow {
-                    animation: atlasGlow 4.4s ease-in-out infinite;
-                }
+        {showShortcuts && (
+          <div className="mb-5 rounded-2xl border border-violet-200/25 bg-violet-500/10 p-4 text-xs text-violet-100">
+            <p className="text-[0.62rem] uppercase tracking-[0.3em] text-violet-200/90">
+              Shortcuts
+            </p>
+            <p className="mt-2">`L` like, `D` dislike, `R` random, `←/→` navigate, `?` toggle this panel.</p>
+          </div>
+        )}
 
-                .atlas-field:hover .atlas-node .atlas-dot {
-                    opacity: 0.25;
-                    filter: blur(1px);
-                }
+        {undoState && (
+          <div className="fixed bottom-5 right-5 z-50 rounded-2xl border border-amber-200/35 bg-[#1f1a0e]/95 px-4 py-3 text-xs text-amber-100 shadow-[0_18px_40px_rgba(0,0,0,0.45)] backdrop-blur">
+            <p className="uppercase tracking-[0.2em] text-amber-200/90">Reaction Saved</p>
+            <button
+              onClick={() => {
+                void undoLastReaction();
+              }}
+              className="mt-2 rounded-full border border-amber-200/40 px-3 py-1 font-medium hover:bg-amber-400/10"
+            >
+              Undo
+            </button>
+          </div>
+        )}
 
-                .atlas-field:hover .atlas-node:hover {
-                    z-index: 30;
-                }
+        {viewMode === "stage" && activeCaption ? (
+          <section className="grid gap-5 xl:grid-cols-[220px_1fr_300px]">
+            <aside className="rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
+              {!focusMode && (
+                <p className="text-[0.62rem] uppercase tracking-[0.3em] text-sky-200/80">
+                  Reaction Panel
+                </p>
+              )}
+              <div className={`${focusMode ? "mt-0" : "mt-4"} space-y-3`}>
+                <button
+                  aria-label="Like caption"
+                  onClick={() => submitVote(activeCaption.id, 1, true)}
+                  disabled={submittingCaptionId === activeCaption.id}
+                  className={`w-full rounded-2xl border px-3 py-4 text-sm font-semibold transition duration-200 ${
+                    (myVotes[activeCaption.id] ?? 0) === 1
+                      ? "border-emerald-300 bg-emerald-400/25 text-emerald-100"
+                      : "border-emerald-300/50 text-emerald-100 hover:bg-emerald-500/15"
+                  } ${reactionPulseCaptionId === activeCaption.id ? "ring-2 ring-emerald-300/55" : ""} disabled:opacity-50`}
+                >
+                  Like
+                </button>
+                <button
+                  aria-label="Dislike caption"
+                  onClick={() => submitVote(activeCaption.id, -1, true)}
+                  disabled={submittingCaptionId === activeCaption.id}
+                  className={`w-full rounded-2xl border px-3 py-4 text-sm font-semibold transition duration-200 ${
+                    (myVotes[activeCaption.id] ?? 0) === -1
+                      ? "border-rose-300 bg-rose-400/25 text-rose-100"
+                      : "border-rose-300/50 text-rose-100 hover:bg-rose-500/15"
+                  } ${reactionPulseCaptionId === activeCaption.id ? "ring-2 ring-rose-300/50" : ""} disabled:opacity-50`}
+                >
+                  Dislike
+                </button>
+              </div>
 
-                .atlas-field:hover .atlas-node:hover .atlas-dot {
-                    opacity: 1;
-                    filter: none;
-                }
-            `}</style>
-        </main>
-    );
+              <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
+                <button
+                  onClick={() => moveActive(-1)}
+                  className="rounded-xl border border-white/20 px-3 py-2 transition duration-150 hover:bg-white/10"
+                >
+                  Previous
+                </button>
+                <button
+                  onClick={() => moveActive(1)}
+                  className="rounded-xl border border-white/20 px-3 py-2 transition duration-150 hover:bg-white/10"
+                >
+                  Next
+                </button>
+              </div>
+              <div className="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-center text-[0.68rem] uppercase tracking-[0.2em] text-slate-300">
+                Item {activeIndex + 1} of {sortedCaptions.length}
+              </div>
+            </aside>
+
+            <article
+              className={`group overflow-hidden rounded-[30px] border border-white/15 bg-[#101b38]/95 shadow-[0_30px_80px_rgba(2,6,23,0.58)] transition duration-220 ${
+                stageTransitioning ? "scale-[0.992] opacity-40" : "scale-100 opacity-100"
+              }`}
+            >
+              <div className="relative">
+                {renderImagePanel(activeCaption, "stage")}
+                <div className="pointer-events-none absolute inset-0 ring-1 ring-white/10" />
+                <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#060b18]/90 via-[#060b18]/45 to-transparent p-4">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-black/35 px-3 py-1 text-xs text-slate-200">
+                    <span>{relativeTime(activeCaption.created_datetime_utc)}</span>
+                    {!focusMode && (
+                      <>
+                        <span className="h-1 w-1 rounded-full bg-slate-300" />
+                        <span>Arrow keys to navigate</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-5">
+                <p className="rounded-[22px] border border-white/10 bg-[#0a1229]/75 px-5 py-4 text-[1.05rem] leading-relaxed text-slate-100">
+                  {activeCaption.content ?? "No caption text."}
+                </p>
+                {submittingCaptionId === activeCaption.id && (
+                  <p aria-live="polite" className="mt-3 text-xs text-slate-400">
+                    Saving reaction...
+                  </p>
+                )}
+              </div>
+            </article>
+
+            <aside className="rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
+              {!focusMode && (
+                <div className="flex items-center justify-between">
+                  <p className="text-[0.62rem] uppercase tracking-[0.3em] text-amber-200/80">
+                    Upcoming Queue
+                  </p>
+                  <span className="text-[11px] text-slate-400">tap to jump</span>
+                </div>
+              )}
+
+              <div className={`relative ${focusMode ? "mt-0" : "mt-4"} h-[420px]`}>
+                {queueCaptions.map((caption, index) => {
+                  const tilt = [-4, 5, -3, 4][index] ?? 0;
+                  return (
+                    <button
+                      key={`queue-${caption.id}`}
+                      onClick={() => focusCaption(caption.id)}
+                      className={`absolute left-0 w-full overflow-hidden rounded-2xl border bg-[#0b142d] text-left transition duration-220 ${
+                        caption.id === activeCaption.id
+                          ? "border-cyan-300/60 shadow-[0_0_0_1px_rgba(103,232,249,0.45)]"
+                          : "border-white/15 hover:border-sky-200/50"
+                      }`}
+                      style={{
+                        top: `${index * 82}px`,
+                        transform: `rotate(${tilt}deg)`,
+                        zIndex: 10 - index,
+                      }}
+                    >
+                      <div className="grid grid-cols-[88px_1fr] gap-2 p-2">
+                        <div className="h-16 overflow-hidden rounded-xl bg-slate-900">
+                          {renderImagePanel(caption, "thumb")}
+                        </div>
+                        <div className="min-w-0">
+                          <p className="truncate text-xs text-slate-200">
+                            {caption.content ?? "No caption"}
+                          </p>
+                          <p className="mt-1 text-[11px] text-slate-400">
+                            {relativeTime(caption.created_datetime_utc)}
+                          </p>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </aside>
+          </section>
+        ) : (
+          <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+            {sortedCaptions.map((caption) => {
+              const myVote = myVotes[caption.id] ?? 0;
+              const isSubmitting = submittingCaptionId === caption.id;
+
+              return (
+                <article
+                  key={caption.id}
+                  className="group flex h-[430px] flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#121d3c]/80 shadow-[0_18px_45px_rgba(2,6,23,0.45)] transition hover:border-cyan-200/35"
+                >
+                  <div className="flex items-center justify-end border-b border-white/10 bg-black/20 px-3 py-2">
+                    <p className="text-[11px] text-slate-400">
+                      {relativeTime(caption.created_datetime_utc)}
+                    </p>
+                  </div>
+
+                  <div className="relative h-56 overflow-hidden">
+                    {renderImagePanel(caption, "card")}
+                  </div>
+
+                  <div className="flex flex-1 flex-col gap-3 p-4">
+                    <p className="min-h-[76px] rounded-xl border border-white/10 bg-black/20 px-3 py-3 text-sm leading-relaxed text-slate-100">
+                      {caption.content ?? "No caption text."}
+                    </p>
+                    <div className="mt-auto flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-xs">
+                        <button
+                          onClick={() => submitVote(caption.id, 1)}
+                          disabled={isSubmitting}
+                          className={`rounded-full border px-3 py-1.5 font-medium transition ${
+                            myVote === 1
+                              ? "border-emerald-300 bg-emerald-400/25 text-emerald-100"
+                              : "border-emerald-300/50 text-emerald-100 hover:bg-emerald-500/15"
+                          } ${reactionPulseCaptionId === caption.id ? "ring-2 ring-emerald-300/40" : ""}`}
+                        >
+                          Like
+                        </button>
+                        <button
+                          onClick={() => submitVote(caption.id, -1)}
+                          disabled={isSubmitting}
+                          className={`rounded-full border px-3 py-1.5 font-medium transition ${
+                            myVote === -1
+                              ? "border-rose-300 bg-rose-400/25 text-rose-100"
+                              : "border-rose-300/50 text-rose-100 hover:bg-rose-500/15"
+                          } ${reactionPulseCaptionId === caption.id ? "ring-2 ring-rose-300/40" : ""}`}
+                        >
+                          Dislike
+                        </button>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setViewMode("stage");
+                          focusCaption(caption.id);
+                        }}
+                        className="rounded-full border border-sky-200/35 px-3 py-1.5 text-xs font-medium text-sky-100 transition hover:bg-sky-400/10"
+                      >
+                        Stage
+                      </button>
+                    </div>
+                    {isSubmitting && (
+                      <p aria-live="polite" className="mt-2 text-xs text-slate-400">
+                        Saving reaction...
+                      </p>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+          </section>
+        )}
+      </div>
+      <style jsx global>{`
+        @import url("https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+        :root {
+          --ui-ease: cubic-bezier(0.2, 0.7, 0, 1);
+          --ui-fast: 150ms;
+          --ui-med: 220ms;
+          --ui-slow: 320ms;
+        }
+
+        body {
+          font-family: "Space Grotesk", "Sora", sans-serif;
+          letter-spacing: 0.005em;
+        }
+
+        .title-display {
+          font-family: "Fraunces", "Times New Roman", serif;
+          font-weight: 650;
+          letter-spacing: -0.01em;
+        }
+
+        button {
+          transition-timing-function: var(--ui-ease);
+        }
+      `}</style>
+    </main>
+  );
 }

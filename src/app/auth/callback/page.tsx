@@ -7,15 +7,16 @@ const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const supabase =
     supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
+const missingSupabaseMessage =
+    "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY.";
 
 export default function AuthCallbackPage() {
-    const [message, setMessage] = useState("Finishing sign-in…");
+    const [message, setMessage] = useState(
+        supabase ? "Finishing sign-in…" : missingSupabaseMessage
+    );
 
     useEffect(() => {
-        if (!supabase) {
-            setMessage("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY.");
-            return;
-        }
+        if (!supabase) return;
 
         (async () => {
             const url = new URL(window.location.href);
