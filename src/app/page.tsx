@@ -10,7 +10,7 @@ type CaptionRow = {
   profile_id: string;
   like_count: number | null;
   created_datetime_utc: string | null;
-  images: { url: string | null } | null;
+  images: { url: string | null } | Array<{ url: string | null }> | null;
 };
 
 type VoteRow = {
@@ -58,6 +58,12 @@ const buildImageAlt = (caption: CaptionRow) => {
   if (!text) return "Image for caption";
   if (text.length <= 90) return `Image for caption: ${text}`;
   return `Image for caption: ${text.slice(0, 87)}...`;
+};
+
+const getCaptionImageUrl = (caption: CaptionRow) => {
+  if (!caption.images) return null;
+  if (Array.isArray(caption.images)) return caption.images[0]?.url ?? null;
+  return caption.images.url ?? null;
 };
 
 const relativeTime = (value: string | null) => {
@@ -500,7 +506,7 @@ export default function Home() {
   }, [activeCaption, moveActive, pickRandom, submitVote, viewMode]);
 
   const renderImagePanel = (caption: CaptionRow, variant: ImageVariant) => {
-    const imageUrl = caption.images?.url;
+    const imageUrl = getCaptionImageUrl(caption);
     const hasWorkingImage = Boolean(imageUrl) && !brokenImages[caption.id];
 
     const sizeClass =
@@ -550,7 +556,7 @@ export default function Home() {
 
   useEffect(() => {
     if (viewMode !== "stage") return;
-    const nextImageUrl = queueCaptions[0]?.images?.url;
+    const nextImageUrl = queueCaptions[0] ? getCaptionImageUrl(queueCaptions[0]) : null;
     if (!nextImageUrl) return;
     const img = new Image();
     img.src = nextImageUrl;
