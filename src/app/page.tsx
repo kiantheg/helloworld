@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 type CaptionRow = {
@@ -11,6 +11,12 @@ type CaptionRow = {
   like_count: number | null;
   created_datetime_utc: string | null;
   images: { url: string | null } | Array<{ url: string | null }> | null;
+};
+
+type SharedImageItem = {
+  id: string;
+  url: string | null;
+  createdAt: string | null;
 };
 
 type VoteRow = {
@@ -26,7 +32,38 @@ type UndoState = {
   captionId: string;
   previousVote: 1 | -1 | 0;
 };
+type UploadHistoryItem = {
+  imageId: string;
+  imageUrl: string | null;
+  createdAt: string | null;
+  captions: CaptionRow[];
+};
+
+type GeneratePresignedUrlResponse = {
+  presignedUrl: string;
+  cdnUrl: string;
+};
+
+type RegisterImageResponse = {
+  imageId: string;
+};
+
+type GenerateCaptionsResponseRow = {
+  id?: string;
+  content?: string | null;
+};
+
 const LOAD_BATCH_SIZE = 60;
+const UPLOAD_HISTORY_LIMIT = 60;
+const PIPELINE_API_BASE = "https://api.almostcrackd.ai";
+const SUPPORTED_UPLOAD_TYPES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/heic",
+]);
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -63,7 +100,36 @@ const buildImageAlt = (caption: CaptionRow) => {
 const getCaptionImageUrl = (caption: CaptionRow) => {
   if (!caption.images) return null;
   if (Array.isArray(caption.images)) return caption.images[0]?.url ?? null;
-  return caption.images.url ?? null;
+  const relationUrl = caption.images.url ?? null;
+  if (relationUrl) return relationUrl;
+
+  const record = caption as unknown as Record<string, unknown>;
+  return extractImageUrl(record);
+};
+
+const hasReadyCaption = (caption: CaptionRow) => Boolean(caption.content?.trim());
+
+const withImageUrlFallback = (
+  captions: CaptionRow[],
+  imageUrlById: Map<string, string | null>
+): CaptionRow[] =>
+  captions.map((caption) => {
+    const existingUrl = getCaptionImageUrl(caption);
+    if (existingUrl) return caption;
+    if (!caption.image_id) return caption;
+    const fallbackUrl = imageUrlById.get(caption.image_id) ?? null;
+    if (!fallbackUrl) return caption;
+    return { ...caption, images: { url: fallbackUrl } };
+  });
+
+const extractImageUrl = (row: Record<string, unknown> | null | undefined): string | null => {
+  if (!row) return null;
+  const candidates = ["url", "cdn_url", "image_url", "public_url"];
+  for (const key of candidates) {
+    const value = row[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return null;
 };
 
 const relativeTime = (value: string | null) => {
@@ -119,7 +185,22 @@ export default function Home() {
     supabase ? null : missingSupabaseError
   );
   const [profileId, setProfileId] = useState<string | null>(null);
+  const [accessToken, setAccessToken] = useState<string | null>(null);
   const [captions, setCaptions] = useState<CaptionRow[]>([]);
+  const [uploadHistory, setUploadHistory] = useState<UploadHistoryItem[]>([]);
+  const [uploadUrlInput, setUploadUrlInput] = useState("");
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadIsCommonUse, setUploadIsCommonUse] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const [lastGeneratedCaptions, setLastGeneratedCaptions] = useState<string[]>([]);
+  const [generatedPreviewImageUrl, setGeneratedPreviewImageUrl] = useState<string | null>(null);
+  const [generatedCaptionIndex, setGeneratedCaptionIndex] = useState(0);
+  const [selectedHistoryImageId, setSelectedHistoryImageId] = useState<string | null>(null);
+  const [sharedImages, setSharedImages] = useState<SharedImageItem[]>([]);
+  const [sharedLibraryVisibleCount, setSharedLibraryVisibleCount] = useState(16);
+  const [workspaceView, setWorkspaceView] = useState<"rating" | "upload">("rating");
   const [rankScoreByCaption, setRankScoreByCaption] = useState<Record<string, number>>({});
   const [myVotes, setMyVotes] = useState<Record<string, number>>({});
   const [submittingCaptionId, setSubmittingCaptionId] = useState<string | null>(null);
@@ -150,6 +231,7 @@ export default function Home() {
   const stageFadeTimerRef = useRef<number | null>(null);
   const undoTimerRef = useRef<number | null>(null);
   const reactionPulseTimerRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -158,18 +240,9 @@ export default function Home() {
     );
   }, [focusMode, showShortcuts, sortMode, viewMode]);
 
-  useEffect(() => {
-    if (!supabase) return;
-
-    const load = async () => {
-      const { data: sessionData } = await supabase.auth.getSession();
-      const session = sessionData.session;
-      if (!session) {
-        window.location.assign("/login");
-        return;
-      }
-
-      setProfileId(session.user.id);
+  const loadBoardData = useCallback(
+    async (userId: string) => {
+      if (!supabase) return;
 
       const { data: captionData, error: captionError } = await supabase
         .from("captions")
@@ -181,11 +254,32 @@ export default function Home() {
 
       if (captionError) {
         setError(captionError.message);
-        setLoading(false);
         return;
       }
 
-      const safeCaptions = (captionData ?? []) as CaptionRow[];
+      const baseCaptions = ((captionData ?? []) as CaptionRow[]).filter(hasReadyCaption);
+      const imageIds = Array.from(
+        new Set(baseCaptions.map((caption) => caption.image_id).filter(Boolean))
+      ) as string[];
+
+      const imageUrlById = new Map<string, string | null>();
+      if (imageIds.length > 0) {
+        const { data: imageRows, error: imageError } = await supabase
+          .from("images")
+          .select("*")
+          .in("id", imageIds);
+
+        if (imageError) {
+          setError(imageError.message);
+          return;
+        }
+
+        (imageRows ?? []).forEach((row) => {
+          imageUrlById.set(row.id as string, extractImageUrl(row as Record<string, unknown>));
+        });
+      }
+
+      const safeCaptions = withImageUrlFallback(baseCaptions, imageUrlById);
       setCaptions(safeCaptions);
       setActiveCaptionId((prev) => {
         if (prev && safeCaptions.some((caption) => caption.id === prev)) return prev;
@@ -193,7 +287,8 @@ export default function Home() {
       });
 
       if (safeCaptions.length === 0) {
-        setLoading(false);
+        setRankScoreByCaption({});
+        setMyVotes({});
         return;
       }
 
@@ -205,7 +300,6 @@ export default function Home() {
 
       if (voteError) {
         setError(voteError.message);
-        setLoading(false);
         return;
       }
 
@@ -214,18 +308,361 @@ export default function Home() {
 
       (voteRows as VoteRow[] | null)?.forEach((vote) => {
         totals[vote.caption_id] = (totals[vote.caption_id] ?? 0) + vote.vote_value;
-        if (vote.profile_id === session.user.id) {
+        if (vote.profile_id === userId) {
           mine[vote.caption_id] = vote.vote_value;
         }
       });
 
       setRankScoreByCaption(totals);
       setMyVotes(mine);
+    },
+    [loadedCount]
+  );
+
+  const loadUploadHistory = useCallback(async (userId: string) => {
+    if (!supabase) return;
+
+    const { data: imageData, error: imageError } = await supabase
+      .from("images")
+      .select("*")
+      .eq("profile_id", userId)
+      .order("created_datetime_utc", { ascending: false })
+      .limit(UPLOAD_HISTORY_LIMIT);
+
+    if (imageError) {
+      setUploadError(imageError.message);
+      return;
+    }
+
+    const imageRows = ((imageData ?? []) as Record<string, unknown>[]).map((row) => ({
+      id: String(row.id ?? ""),
+      url: extractImageUrl(row),
+      created_datetime_utc: (row.created_datetime_utc as string | null) ?? null,
+    }));
+    if (imageRows.length === 0) {
+      setUploadHistory([]);
+      setSelectedHistoryImageId(null);
+      return;
+    }
+
+    const imageIds = imageRows.map((row) => row.id);
+    const { data: captionData, error: captionError } = await supabase
+      .from("captions")
+      .select("id, content, image_id, profile_id, like_count, created_datetime_utc, images(url)")
+      .in("image_id", imageIds)
+      .order("created_datetime_utc", { ascending: false });
+
+    if (captionError) {
+      setUploadError(captionError.message);
+      return;
+    }
+
+    const byImageId = new Map<string, CaptionRow[]>();
+    const imageUrlById = new Map<string, string | null>();
+    imageRows.forEach((row) => {
+      imageUrlById.set(row.id, row.url ?? null);
+    });
+
+    withImageUrlFallback((captionData ?? []) as CaptionRow[], imageUrlById).forEach((row) => {
+      if (!row.image_id) return;
+      if (!byImageId.has(row.image_id)) byImageId.set(row.image_id, []);
+      byImageId.get(row.image_id)!.push(row);
+    });
+
+    const nextHistory = imageRows.map((row) => ({
+      imageId: row.id,
+      imageUrl: row.url,
+      createdAt: row.created_datetime_utc,
+      captions: (byImageId.get(row.id) ?? []).filter(hasReadyCaption),
+    }));
+    setUploadHistory(nextHistory);
+    setSelectedHistoryImageId((prev) => prev ?? nextHistory[0]?.imageId ?? null);
+  }, []);
+
+  const loadSharedImageLibrary = useCallback(async () => {
+    if (!supabase) return;
+
+    const { data, error: sharedError } = await supabase
+      .from("images")
+      .select("*")
+      .eq("is_common_use", true)
+      .order("created_datetime_utc", { ascending: false })
+      .limit(80);
+
+    if (sharedError) {
+      setUploadError(sharedError.message);
+      return;
+    }
+
+    const rows = (data ?? []) as Record<string, unknown>[];
+    setSharedImages(
+      rows
+        .map((row) => ({
+          id: String(row.id ?? ""),
+          url: extractImageUrl(row),
+          createdAt: (row.created_datetime_utc as string | null) ?? null,
+        }))
+        .filter((row) => Boolean(row.id) && Boolean(row.url))
+    );
+  }, []);
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      setUploadError(null);
+
+      const { data: sessionData } = await supabase.auth.getSession();
+      const session = sessionData.session;
+      if (!session) {
+        window.location.assign("/login");
+        return;
+      }
+
+      setProfileId(session.user.id);
+      setAccessToken(session.access_token ?? null);
+
+      await loadBoardData(session.user.id);
+      await loadUploadHistory(session.user.id);
+      await loadSharedImageLibrary();
       setLoading(false);
     };
 
     void load();
-  }, [loadedCount]);
+  }, [loadBoardData, loadSharedImageLibrary, loadUploadHistory]);
+
+  const generateCaptionsForImage = useCallback(
+    async (imageId: string, token: string) => {
+      const response = await fetch(`${PIPELINE_API_BASE}/pipeline/generate-captions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ imageId }),
+      });
+      if (!response.ok) {
+        throw new Error(`Caption generation failed (${response.status})`);
+      }
+
+      const generated = (await response.json()) as GenerateCaptionsResponseRow[];
+      const texts = generated
+        .map((row) => row.content?.trim() ?? "")
+        .filter((value) => Boolean(value));
+      setLastGeneratedCaptions(texts);
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (lastGeneratedCaptions.length === 0) {
+      setGeneratedCaptionIndex(0);
+      return;
+    }
+    setGeneratedCaptionIndex((prev) =>
+      Math.min(prev, Math.max(0, lastGeneratedCaptions.length - 1))
+    );
+  }, [lastGeneratedCaptions]);
+
+  const registerAndGenerateFromUrl = useCallback(
+    async (imageUrl: string) => {
+      if (!supabase || !accessToken || !profileId) {
+        window.location.assign("/login");
+        return;
+      }
+
+      setUploadBusy(true);
+      setUploadError(null);
+      setUploadStatus("Registering image URL...");
+      setGeneratedPreviewImageUrl(imageUrl);
+      setLastGeneratedCaptions([]);
+      setGeneratedCaptionIndex(0);
+
+      try {
+        const registerResponse = await fetch(`${PIPELINE_API_BASE}/pipeline/upload-image-from-url`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ imageUrl, isCommonUse: uploadIsCommonUse }),
+        });
+
+        if (!registerResponse.ok) {
+          throw new Error(`Image registration failed (${registerResponse.status})`);
+        }
+
+        const registerBody = (await registerResponse.json()) as RegisterImageResponse;
+        setUploadStatus("Generating captions...");
+        await generateCaptionsForImage(registerBody.imageId, accessToken);
+
+        setUploadStatus("Refreshing board...");
+        await loadBoardData(profileId);
+        await loadUploadHistory(profileId);
+        await loadSharedImageLibrary();
+        setUploadStatus("Done");
+      } catch (uploadErr) {
+        setUploadError(uploadErr instanceof Error ? uploadErr.message : "Upload failed.");
+      } finally {
+        setUploadBusy(false);
+      }
+    },
+    [
+      accessToken,
+      generateCaptionsForImage,
+      loadBoardData,
+      loadSharedImageLibrary,
+      loadUploadHistory,
+      profileId,
+      uploadIsCommonUse,
+    ]
+  );
+
+  const uploadFileAndGenerate = useCallback(
+    async (file: File) => {
+      if (!accessToken) {
+        window.location.assign("/login");
+        return;
+      }
+
+      const normalizedType = file.type.toLowerCase();
+      if (!SUPPORTED_UPLOAD_TYPES.has(normalizedType)) {
+        setUploadError(`Unsupported file type: ${file.type || "unknown"}`);
+        return;
+      }
+
+      setUploadBusy(true);
+      setUploadError(null);
+
+      try {
+        setUploadStatus("Getting upload URL...");
+        const presignedResponse = await fetch(
+          `${PIPELINE_API_BASE}/pipeline/generate-presigned-url`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ contentType: normalizedType }),
+          }
+        );
+
+        if (!presignedResponse.ok) {
+          throw new Error(`Unable to create upload URL (${presignedResponse.status})`);
+        }
+
+        const presignedBody = (await presignedResponse.json()) as GeneratePresignedUrlResponse;
+
+        setUploadStatus("Uploading image bytes...");
+        const putResponse = await fetch(presignedBody.presignedUrl, {
+          method: "PUT",
+          headers: { "Content-Type": normalizedType },
+          body: file,
+        });
+        if (!putResponse.ok) {
+          throw new Error(`File upload failed (${putResponse.status})`);
+        }
+
+        await registerAndGenerateFromUrl(presignedBody.cdnUrl);
+      } catch (uploadErr) {
+        setUploadError(uploadErr instanceof Error ? uploadErr.message : "File upload failed.");
+        setUploadBusy(false);
+      }
+    },
+    [accessToken, registerAndGenerateFromUrl]
+  );
+
+  const generateFromSharedImage = useCallback(
+    async (imageId: string) => {
+      if (!accessToken || !profileId) {
+        window.location.assign("/login");
+        return;
+      }
+
+      setUploadBusy(true);
+      setUploadError(null);
+      setUploadStatus("Generating captions from library image...");
+      const preview = sharedImages.find((image) => image.id === imageId)?.url ?? null;
+      setGeneratedPreviewImageUrl(preview);
+      setLastGeneratedCaptions([]);
+      setGeneratedCaptionIndex(0);
+      try {
+        await generateCaptionsForImage(imageId, accessToken);
+        await loadBoardData(profileId);
+        await loadUploadHistory(profileId);
+        await loadSharedImageLibrary();
+        setUploadStatus("Done");
+      } catch (uploadErr) {
+        setUploadError(
+          uploadErr instanceof Error ? uploadErr.message : "Unable to generate captions."
+        );
+      } finally {
+        setUploadBusy(false);
+      }
+    },
+    [
+      accessToken,
+      generateCaptionsForImage,
+      loadBoardData,
+      loadSharedImageLibrary,
+      loadUploadHistory,
+      profileId,
+      sharedImages,
+    ]
+  );
+
+  const onUrlSubmit = useCallback(async () => {
+    const value = uploadUrlInput.trim();
+    if (!value) return;
+
+    try {
+      const parsed = new URL(value);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        setUploadError("Image URL must start with http:// or https://");
+        return;
+      }
+    } catch {
+      setUploadError("Enter a valid image URL.");
+      return;
+    }
+
+    await registerAndGenerateFromUrl(value);
+    setUploadUrlInput("");
+  }, [registerAndGenerateFromUrl, uploadUrlInput]);
+
+  const onFileSelected = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      await uploadFileAndGenerate(file);
+      event.target.value = "";
+    },
+    [uploadFileAndGenerate]
+  );
+
+  const onDropAreaDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragActive(true);
+  }, []);
+
+  const onDropAreaDragLeave = useCallback((event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragActive(false);
+  }, []);
+
+  const onDropAreaDrop = useCallback(
+    async (event: DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      setDragActive(false);
+      const file = event.dataTransfer.files?.[0];
+      if (!file) return;
+      await uploadFileAndGenerate(file);
+    },
+    [uploadFileAndGenerate]
+  );
 
   const sortedCaptions = useMemo(() => {
     const list = [...captions];
@@ -474,6 +911,7 @@ export default function Home() {
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (isTypingTarget(event.target)) return;
+      if (workspaceView !== "rating") return;
       if (event.key === "?") {
         event.preventDefault();
         setShowShortcuts((prev) => !prev);
@@ -503,7 +941,7 @@ export default function Home() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeCaption, moveActive, pickRandom, submitVote, viewMode]);
+  }, [activeCaption, moveActive, pickRandom, submitVote, viewMode, workspaceView]);
 
   const renderImagePanel = (caption: CaptionRow, variant: ImageVariant) => {
     const imageUrl = getCaptionImageUrl(caption);
@@ -579,15 +1017,24 @@ export default function Home() {
     viewMode === "stage"
       ? "border-emerald-300/40 bg-emerald-400/12 text-emerald-100"
       : "border-cyan-300/40 bg-cyan-400/12 text-cyan-100";
+  const selectedUploadHistory =
+    uploadHistory.find((item) => item.imageId === selectedHistoryImageId) ?? uploadHistory[0] ?? null;
+  const generatedCaptionText =
+    lastGeneratedCaptions[generatedCaptionIndex] ??
+    lastGeneratedCaptions[0] ??
+    "Generate captions to preview in meme format.";
 
   return (
-    <main className="min-h-screen bg-[#080f22] text-slate-100">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_7%_15%,rgba(251,191,36,0.16),transparent_36%),radial-gradient(circle_at_88%_8%,rgba(16,185,129,0.15),transparent_35%),radial-gradient(circle_at_50%_92%,rgba(56,189,248,0.16),transparent_40%)]" />
-      <div className="pointer-events-none absolute inset-0 opacity-35 bg-[linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:52px_52px]" />
+    <main className="lux-root min-h-screen bg-[#080f22] text-slate-100">
+      <div className="lux-aurora pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_7%_15%,rgba(251,191,36,0.16),transparent_36%),radial-gradient(circle_at_88%_8%,rgba(16,185,129,0.15),transparent_35%),radial-gradient(circle_at_50%_92%,rgba(56,189,248,0.16),transparent_40%)]" />
+      <div className="lux-grid pointer-events-none absolute inset-0 opacity-35 bg-[linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:52px_52px]" />
+      <div className="lux-noise pointer-events-none absolute inset-0" />
+      <div className="lux-orb lux-orb-a pointer-events-none absolute -top-10 -left-10 h-64 w-64 rounded-full" />
+      <div className="lux-orb lux-orb-b pointer-events-none absolute top-20 right-0 h-72 w-72 rounded-full" />
 
       <div className="relative mx-auto max-w-7xl px-4 py-8 sm:px-8">
         <header
-          className={`relative z-30 mb-8 rounded-[30px] border bg-[#0f1a37]/70 p-6 backdrop-blur-xl ${
+          className={`lux-panel lux-float-in relative z-30 mb-8 rounded-[30px] border bg-[#0f1a37]/70 p-6 backdrop-blur-xl ${
             focusMode ? "border-white/5 opacity-80" : "border-white/10"
           }`}
         >
@@ -656,45 +1103,81 @@ export default function Home() {
           <div className={`mt-5 flex flex-wrap items-center gap-3 text-xs ${focusMode ? "opacity-60" : ""}`}>
             <div className="inline-flex rounded-full border border-white/15 bg-black/20 p-1">
               <button
-                onClick={() => setViewMode("stage")}
-                className={`rounded-full px-4 py-1.5 ${
-                  viewMode === "stage" ? "bg-emerald-300/20 text-emerald-100" : "text-slate-300"
+                onClick={() => setWorkspaceView("rating")}
+                className={`lux-chip rounded-full px-4 py-1.5 ${
+                  workspaceView === "rating"
+                    ? "lux-chip-active bg-cyan-300/20 text-cyan-100"
+                    : "text-slate-300"
                 }`}
               >
-                Stage
+                Rating
               </button>
               <button
-                onClick={() => setViewMode("wall")}
-                className={`rounded-full px-4 py-1.5 ${
-                  viewMode === "wall" ? "bg-emerald-300/20 text-emerald-100" : "text-slate-300"
+                onClick={() => setWorkspaceView("upload")}
+                className={`lux-chip rounded-full px-4 py-1.5 ${
+                  workspaceView === "upload"
+                    ? "lux-chip-active bg-cyan-300/20 text-cyan-100"
+                    : "text-slate-300"
                 }`}
               >
-                Wall
+                Upload
               </button>
             </div>
 
-            <div className="inline-flex rounded-full border border-white/15 bg-black/20 p-1">
-              <button
-                onClick={() => setSortMode("top")}
-                className={`rounded-full px-4 py-1.5 ${
-                  sortMode === "top" ? "bg-sky-300/20 text-sky-100" : "text-slate-300"
-                }`}
-              >
-                Top
-              </button>
-              <button
-                onClick={() => setSortMode("new")}
-                className={`rounded-full px-4 py-1.5 ${
-                  sortMode === "new" ? "bg-sky-300/20 text-sky-100" : "text-slate-300"
-                }`}
-              >
-                New
-              </button>
-            </div>
+            {workspaceView === "rating" && (
+              <div className="inline-flex rounded-full border border-white/15 bg-black/20 p-1">
+                <button
+                  onClick={() => setViewMode("stage")}
+                  className={`lux-chip rounded-full px-4 py-1.5 ${
+                    viewMode === "stage"
+                      ? "lux-chip-active bg-emerald-300/20 text-emerald-100"
+                      : "text-slate-300"
+                  }`}
+                >
+                  Stage
+                </button>
+                <button
+                  onClick={() => setViewMode("wall")}
+                  className={`lux-chip rounded-full px-4 py-1.5 ${
+                    viewMode === "wall"
+                      ? "lux-chip-active bg-emerald-300/20 text-emerald-100"
+                      : "text-slate-300"
+                  }`}
+                >
+                  Wall
+                </button>
+              </div>
+            )}
+
+            {workspaceView === "rating" && (
+              <div className="inline-flex rounded-full border border-white/15 bg-black/20 p-1">
+                <button
+                  onClick={() => setSortMode("top")}
+                  className={`lux-chip rounded-full px-4 py-1.5 ${
+                    sortMode === "top"
+                      ? "lux-chip-active bg-sky-300/20 text-sky-100"
+                      : "text-slate-300"
+                  }`}
+                >
+                  Top
+                </button>
+                <button
+                  onClick={() => setSortMode("new")}
+                  className={`lux-chip rounded-full px-4 py-1.5 ${
+                    sortMode === "new"
+                      ? "lux-chip-active bg-sky-300/20 text-sky-100"
+                      : "text-slate-300"
+                  }`}
+                >
+                  New
+                </button>
+              </div>
+            )}
 
             <button
               onClick={pickRandom}
-              className="rounded-full border border-amber-200/35 px-4 py-2 text-amber-100 hover:bg-amber-400/10"
+              disabled={workspaceView !== "rating"}
+              className="lux-glow-btn rounded-full border border-amber-200/35 px-4 py-2 text-amber-100 hover:bg-amber-400/10"
             >
               Surprise Me
             </button>
@@ -704,7 +1187,289 @@ export default function Home() {
           </div>
         </header>
 
-        {error && (
+        {workspaceView === "upload" && (
+          <section className="lux-float-in mb-6 grid gap-5 xl:grid-cols-[1.25fr_1fr]">
+          <article className="lux-card rounded-[24px] border border-white/10 bg-[#0f1935]/75 p-5 shadow-[0_18px_42px_rgba(2,6,23,0.4)]">
+            <p className="text-[0.62rem] uppercase tracking-[0.3em] text-cyan-200/80">
+              Upload Image
+            </p>
+            <p className="mt-2 text-sm text-slate-300">
+              Upload from your computer, drop a file here, or paste an image link.
+            </p>
+            <label className="mt-3 inline-flex items-center gap-2 rounded-full border border-white/15 bg-black/20 px-3 py-1.5 text-xs text-slate-200">
+              <input
+                type="checkbox"
+                checked={uploadIsCommonUse}
+                onChange={(event) => setUploadIsCommonUse(event.target.checked)}
+                className="h-4 w-4 accent-emerald-400"
+              />
+              Make this image available to everyone
+            </label>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/jpeg,image/jpg,image/png,image/webp,image/gif,image/heic"
+              onChange={(event) => {
+                void onFileSelected(event);
+              }}
+              className="hidden"
+            />
+
+            <div
+              onDragOver={onDropAreaDragOver}
+              onDragLeave={onDropAreaDragLeave}
+              onDrop={(event) => {
+                void onDropAreaDrop(event);
+              }}
+              className={`mt-4 rounded-2xl border border-dashed p-5 text-center transition ${
+                dragActive
+                  ? "border-cyan-300/70 bg-cyan-400/10"
+                  : "border-white/20 bg-[#0a1229]/60"
+              }`}
+            >
+              <p className="text-sm text-slate-200">Drag and drop image file here</p>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploadBusy}
+                className="mt-3 rounded-full border border-cyan-200/40 bg-cyan-400/10 px-4 py-2 text-xs uppercase tracking-[0.2em] text-cyan-100 hover:bg-cyan-400/20 disabled:opacity-50"
+              >
+                Choose File
+              </button>
+            </div>
+
+            <div className="mt-4 flex gap-2">
+              <input
+                value={uploadUrlInput}
+                onChange={(event) => setUploadUrlInput(event.target.value)}
+                placeholder="https://example.com/image.jpg"
+                className="w-full rounded-xl border border-white/15 bg-black/20 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-300/60"
+              />
+              <button
+                onClick={() => {
+                  void onUrlSubmit();
+                }}
+                disabled={uploadBusy}
+                className="rounded-xl border border-sky-200/35 px-4 py-2 text-xs uppercase tracking-[0.16em] text-sky-100 hover:bg-sky-400/10 disabled:opacity-50"
+              >
+                Submit URL
+              </button>
+            </div>
+
+            {uploadStatus && (
+              <p className="mt-3 text-xs text-cyan-200/90">Status: {uploadStatus}</p>
+            )}
+            {uploadError && (
+              <p className="mt-3 rounded-lg border border-rose-300/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+                Upload error: {uploadError}
+              </p>
+            )}
+            {lastGeneratedCaptions.length > 0 && (
+              <div className="mt-3 rounded-lg border border-emerald-300/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100">
+                <p className="uppercase tracking-[0.18em] text-emerald-200/90">Latest Captions</p>
+                <div className="mt-2 space-y-1">
+                  {lastGeneratedCaptions.slice(0, 3).map((line, index) => (
+                    <p key={`latest-generated-${line}-${index}`} className="text-emerald-100/95">
+                      {line}
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <p className="text-[0.62rem] uppercase tracking-[0.2em] text-cyan-200/90">
+                  Meme Preview Browser
+                </p>
+                <span className="text-[11px] text-slate-400">
+                  {lastGeneratedCaptions.length > 0
+                    ? `${generatedCaptionIndex + 1}/${lastGeneratedCaptions.length}`
+                    : "0/0"}
+                </span>
+              </div>
+
+              {generatedPreviewImageUrl ? (
+                <div className="relative overflow-hidden rounded-lg border border-white/10 bg-[#050a18]">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={generatedPreviewImageUrl}
+                    alt="Generated meme preview"
+                    className="h-80 w-full object-contain"
+                    loading="lazy"
+                  />
+                  <div className="pointer-events-none absolute inset-x-0 bottom-0 p-3">
+                    <p className="meme-text text-center">{generatedCaptionText}</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex h-80 items-center justify-center rounded-lg border border-white/10 bg-[#050a18] text-xs text-slate-400">
+                  Upload/select an image to start meme preview.
+                </div>
+              )}
+
+              <div className="mt-3 flex items-center gap-2">
+                <button
+                  onClick={() =>
+                    setGeneratedCaptionIndex((prev) =>
+                      lastGeneratedCaptions.length > 0
+                        ? (prev - 1 + lastGeneratedCaptions.length) % lastGeneratedCaptions.length
+                        : 0
+                    )
+                  }
+                  disabled={lastGeneratedCaptions.length === 0}
+                  className="rounded-lg border border-white/20 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10 disabled:opacity-40"
+                >
+                  Prev
+                </button>
+                <button
+                  onClick={() =>
+                    setGeneratedCaptionIndex((prev) =>
+                      lastGeneratedCaptions.length > 0
+                        ? (prev + 1) % lastGeneratedCaptions.length
+                        : 0
+                    )
+                  }
+                  disabled={lastGeneratedCaptions.length === 0}
+                  className="rounded-lg border border-white/20 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10 disabled:opacity-40"
+                >
+                  Next
+                </button>
+                <p className="truncate text-xs text-slate-300">{generatedCaptionText}</p>
+              </div>
+            </div>
+          </article>
+
+          <article className="lux-card rounded-[24px] border border-white/10 bg-[#0f1935]/75 p-5 shadow-[0_18px_42px_rgba(2,6,23,0.4)]">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-[0.62rem] uppercase tracking-[0.3em] text-amber-200/80">
+                Your Upload History
+              </p>
+              <span className="text-[11px] text-slate-400">{uploadHistory.length} images</span>
+            </div>
+            <div className="mt-4 max-h-[220px] space-y-3 overflow-auto pr-1">
+              {uploadHistory.length === 0 && (
+                <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-300">
+                  No uploads yet.
+                </p>
+              )}
+              {uploadHistory.map((item) => (
+                <button
+                  key={`upload-history-${item.imageId}`}
+                  onClick={() => setSelectedHistoryImageId(item.imageId)}
+                  className={`w-full rounded-xl border bg-black/20 p-3 text-left ${
+                    selectedUploadHistory?.imageId === item.imageId
+                      ? "border-cyan-300/55"
+                      : "border-white/10"
+                  }`}
+                >
+                  <div className="grid grid-cols-[140px_1fr] gap-3">
+                    <div className="h-28 overflow-hidden rounded-lg bg-[#050a18]">
+                      {item.imageUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={item.imageUrl}
+                          alt="Uploaded source"
+                          className="h-full w-full object-contain"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <div className="flex h-full items-center justify-center text-xs text-slate-500">
+                          no image
+                        </div>
+                      )}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="truncate text-[11px] text-slate-400">
+                        {relativeTime(item.createdAt)}
+                      </p>
+                      <p className="mt-1 text-xs text-slate-200">
+                        {item.captions.length} caption{item.captions.length === 1 ? "" : "s"}
+                      </p>
+                      <p className="mt-2 max-h-14 overflow-hidden rounded-md border border-white/10 bg-black/20 px-2 py-1.5 text-xs text-slate-200">
+                        {item.captions[0]?.content ?? "Caption not generated yet."}
+                      </p>
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-3">
+              {selectedUploadHistory ? (
+                <>
+                  <p className="text-[0.62rem] uppercase tracking-[0.2em] text-cyan-200/85">
+                    Captions For Selected Image
+                  </p>
+                  {selectedUploadHistory.captions.length > 0 ? (
+                    <div className="mt-2 max-h-[160px] space-y-2 overflow-auto pr-1">
+                      {selectedUploadHistory.captions.map((caption) => (
+                        <p
+                          key={`selected-history-caption-${caption.id}`}
+                          className="rounded-lg border border-white/10 px-2.5 py-2 text-xs text-slate-200"
+                        >
+                          {caption.content}
+                        </p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-xs text-amber-200/90">Caption not generated yet.</p>
+                  )}
+                </>
+              ) : (
+                <p className="text-xs text-slate-300">Select an uploaded image to view captions.</p>
+              )}
+            </div>
+
+            <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-3">
+              <p className="text-[0.62rem] uppercase tracking-[0.2em] text-emerald-200/85">
+                Shared Image Library
+              </p>
+              {sharedImages.length > 0 ? (
+                <>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    {sharedImages.slice(0, sharedLibraryVisibleCount).map((image) => (
+                      <button
+                        key={`shared-image-${image.id}`}
+                        onClick={() => {
+                          void generateFromSharedImage(image.id);
+                        }}
+                        disabled={uploadBusy}
+                        className="overflow-hidden rounded-lg border border-white/10 bg-[#0a1229] text-left hover:border-emerald-300/45 disabled:opacity-50"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={image.url ?? ""}
+                          alt="Shared image"
+                          className="h-24 w-full object-contain bg-[#050a18]"
+                          loading="lazy"
+                        />
+                        <p className="px-2 py-1.5 text-[10px] text-slate-300">
+                          {relativeTime(image.createdAt)}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                  {sharedLibraryVisibleCount < sharedImages.length && (
+                    <button
+                      onClick={() => setSharedLibraryVisibleCount((prev) => prev + 16)}
+                      className="mt-3 w-full rounded-lg border border-emerald-300/35 bg-emerald-500/10 px-3 py-2 text-xs uppercase tracking-[0.14em] text-emerald-100 hover:bg-emerald-500/20"
+                    >
+                      Load 16 More Shared Images
+                    </button>
+                  )}
+                </>
+              ) : (
+                <p className="mt-2 text-xs text-slate-300">
+                  No shared images available or you do not have permission to read them yet.
+                </p>
+              )}
+            </div>
+          </article>
+          </section>
+        )}
+
+        {workspaceView === "rating" && error && (
           <p
             aria-live="polite"
             className="mb-5 rounded-xl border border-rose-300/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200"
@@ -713,7 +1478,7 @@ export default function Home() {
           </p>
         )}
 
-        {showShortcuts && (
+        {workspaceView === "rating" && showShortcuts && (
           <div className="mb-5 rounded-2xl border border-violet-200/25 bg-violet-500/10 p-4 text-xs text-violet-100">
             <p className="text-[0.62rem] uppercase tracking-[0.3em] text-violet-200/90">
               Shortcuts
@@ -722,7 +1487,7 @@ export default function Home() {
           </div>
         )}
 
-        {undoState && (
+        {workspaceView === "rating" && undoState && (
           <div className="fixed bottom-5 right-5 z-50 rounded-2xl border border-amber-200/35 bg-[#1f1a0e]/95 px-4 py-3 text-xs text-amber-100 shadow-[0_18px_40px_rgba(0,0,0,0.45)] backdrop-blur">
             <p className="uppercase tracking-[0.2em] text-amber-200/90">Reaction Saved</p>
             <button
@@ -736,9 +1501,9 @@ export default function Home() {
           </div>
         )}
 
-        {viewMode === "stage" && activeCaption ? (
-          <section className="grid gap-5 xl:grid-cols-[220px_1fr_300px]">
-            <aside className="rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
+        {workspaceView === "rating" && (viewMode === "stage" && activeCaption ? (
+          <section className="lux-float-in grid gap-5 xl:grid-cols-[220px_1fr_300px]">
+            <aside className="lux-card rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
               {!focusMode && (
                 <p className="text-[0.62rem] uppercase tracking-[0.3em] text-sky-200/80">
                   Reaction Panel
@@ -791,7 +1556,7 @@ export default function Home() {
             </aside>
 
             <article
-              className={`group overflow-hidden rounded-[30px] border border-white/15 bg-[#101b38]/95 shadow-[0_30px_80px_rgba(2,6,23,0.58)] transition duration-220 ${
+              className={`lux-card group overflow-hidden rounded-[30px] border border-white/15 bg-[#101b38]/95 shadow-[0_30px_80px_rgba(2,6,23,0.58)] transition duration-220 ${
                 stageTransitioning ? "scale-[0.992] opacity-40" : "scale-100 opacity-100"
               }`}
             >
@@ -823,7 +1588,7 @@ export default function Home() {
               </div>
             </article>
 
-            <aside className="rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
+            <aside className="lux-card rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
               {!focusMode && (
                 <div className="flex items-center justify-between">
                   <p className="text-[0.62rem] uppercase tracking-[0.3em] text-amber-200/80">
@@ -840,7 +1605,7 @@ export default function Home() {
                     <button
                       key={`queue-${caption.id}`}
                       onClick={() => focusCaption(caption.id)}
-                      className={`absolute left-0 w-full overflow-hidden rounded-2xl border bg-[#0b142d] text-left transition duration-220 ${
+                      className={`lux-float-in absolute left-0 w-full overflow-hidden rounded-2xl border bg-[#0b142d] text-left transition duration-220 ${
                         caption.id === activeCaption.id
                           ? "border-cyan-300/60 shadow-[0_0_0_1px_rgba(103,232,249,0.45)]"
                           : "border-white/15 hover:border-sky-200/50"
@@ -849,6 +1614,7 @@ export default function Home() {
                         top: `${index * 82}px`,
                         transform: `rotate(${tilt}deg)`,
                         zIndex: 10 - index,
+                        animationDelay: `${index * 60}ms`,
                       }}
                     >
                       <div className="grid grid-cols-[88px_1fr] gap-2 p-2">
@@ -871,15 +1637,16 @@ export default function Home() {
             </aside>
           </section>
         ) : (
-          <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
-            {sortedCaptions.map((caption) => {
+          <section className="lux-float-in grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+            {sortedCaptions.map((caption, index) => {
               const myVote = myVotes[caption.id] ?? 0;
               const isSubmitting = submittingCaptionId === caption.id;
 
               return (
                 <article
                   key={caption.id}
-                  className="group flex h-[430px] flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#121d3c]/80 shadow-[0_18px_45px_rgba(2,6,23,0.45)] transition hover:border-cyan-200/35"
+                  className="lux-card lux-float-in group flex h-[430px] flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#121d3c]/80 shadow-[0_18px_45px_rgba(2,6,23,0.45)] transition hover:border-cyan-200/35"
+                  style={{ animationDelay: `${(index % 9) * 55}ms` }}
                 >
                   <div className="flex items-center justify-end border-b border-white/10 bg-black/20 px-3 py-2">
                     <p className="text-[11px] text-slate-400">
@@ -940,7 +1707,7 @@ export default function Home() {
               );
             })}
           </section>
-        )}
+        ))}
       </div>
       <style jsx global>{`
         @import url("https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
@@ -950,11 +1717,47 @@ export default function Home() {
           --ui-fast: 150ms;
           --ui-med: 220ms;
           --ui-slow: 320ms;
+          --lux-glow: rgba(56, 189, 248, 0.22);
         }
 
         body {
           font-family: "Space Grotesk", "Sora", sans-serif;
           letter-spacing: 0.005em;
+          scroll-behavior: smooth;
+        }
+
+        ::selection {
+          background: rgba(125, 211, 252, 0.25);
+          color: #f8fafc;
+        }
+
+        * {
+          scrollbar-width: thin;
+          scrollbar-color: rgba(148, 163, 184, 0.35) rgba(15, 23, 42, 0.45);
+        }
+
+        *::-webkit-scrollbar {
+          height: 10px;
+          width: 10px;
+        }
+
+        *::-webkit-scrollbar-track {
+          background: rgba(15, 23, 42, 0.45);
+        }
+
+        *::-webkit-scrollbar-thumb {
+          background: rgba(148, 163, 184, 0.35);
+          border-radius: 999px;
+          border: 2px solid rgba(15, 23, 42, 0.45);
+        }
+
+        input {
+          transition: border-color var(--ui-med) var(--ui-ease), box-shadow var(--ui-med) var(--ui-ease),
+            background-color var(--ui-med) var(--ui-ease);
+        }
+
+        input:focus {
+          box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
         }
 
         .title-display {
@@ -965,6 +1768,205 @@ export default function Home() {
 
         button {
           transition-timing-function: var(--ui-ease);
+          transition-property: transform, box-shadow, background-color, border-color, opacity, color;
+          transition-duration: var(--ui-med);
+          will-change: transform;
+        }
+
+        button:hover:not(:disabled) {
+          transform: translateY(-1px);
+          box-shadow: 0 10px 24px rgba(2, 6, 23, 0.35);
+        }
+
+        button:active:not(:disabled) {
+          transform: translateY(0);
+          transition-duration: var(--ui-fast);
+        }
+
+        .lux-root {
+          isolation: isolate;
+        }
+
+        .lux-aurora {
+          animation: luxAuroraShift 24s ease-in-out infinite alternate;
+        }
+
+        .lux-grid {
+          animation: luxGridShift 30s linear infinite;
+        }
+
+        .lux-noise {
+          opacity: 0.08;
+          background-image: radial-gradient(rgba(255, 255, 255, 0.3) 0.4px, transparent 0.4px);
+          background-size: 3px 3px;
+          mix-blend-mode: soft-light;
+        }
+
+        .lux-orb {
+          filter: blur(38px);
+          opacity: 0.2;
+          animation: luxOrbDrift 16s ease-in-out infinite;
+        }
+
+        .lux-orb-a {
+          background: radial-gradient(circle at 40% 40%, rgba(16, 185, 129, 0.45), rgba(16, 185, 129, 0));
+        }
+
+        .lux-orb-b {
+          background: radial-gradient(circle at 50% 50%, rgba(59, 130, 246, 0.45), rgba(59, 130, 246, 0));
+          animation-delay: -4s;
+        }
+
+        .lux-panel {
+          box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, 0.08),
+            0 22px 58px rgba(2, 6, 23, 0.48);
+          position: relative;
+          overflow: hidden;
+        }
+
+        .lux-panel::after {
+          content: "";
+          position: absolute;
+          inset: -1px;
+          background: linear-gradient(110deg, transparent 20%, rgba(255, 255, 255, 0.08) 50%, transparent 80%);
+          transform: translateX(-110%);
+          animation: luxShimmer 9s ease-in-out infinite;
+          pointer-events: none;
+        }
+
+        .lux-card {
+          backdrop-filter: blur(14px);
+          position: relative;
+          overflow: hidden;
+          transition: transform var(--ui-med) var(--ui-ease), box-shadow var(--ui-med) var(--ui-ease),
+            border-color var(--ui-med) var(--ui-ease);
+        }
+
+        .lux-card::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          background: radial-gradient(
+            420px circle at var(--mx, -30%) var(--my, -30%),
+            rgba(255, 255, 255, 0.14),
+            transparent 40%
+          );
+          opacity: 0;
+          transition: opacity var(--ui-med) var(--ui-ease);
+          pointer-events: none;
+        }
+
+        .lux-card:hover {
+          transform: translateY(-4px);
+          box-shadow:
+            0 18px 44px rgba(2, 6, 23, 0.45),
+            0 0 0 1px rgba(148, 163, 184, 0.2);
+        }
+
+        .lux-card:hover::before {
+          opacity: 1;
+        }
+
+        .lux-float-in {
+          animation: luxFadeInUp 620ms var(--ui-ease) both;
+        }
+
+        .lux-chip {
+          border: 1px solid rgba(148, 163, 184, 0.18);
+          transition: border-color var(--ui-med) var(--ui-ease), background-color var(--ui-med) var(--ui-ease),
+            color var(--ui-med) var(--ui-ease), box-shadow var(--ui-med) var(--ui-ease);
+        }
+
+        .lux-chip-active {
+          box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.22), 0 8px 20px rgba(15, 23, 42, 0.35);
+        }
+
+        .lux-glow-btn {
+          box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.2), 0 14px 28px rgba(245, 158, 11, 0.15);
+        }
+
+        @keyframes luxFadeInUp {
+          from {
+            opacity: 0;
+            transform: translateY(16px) scale(0.995);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+          }
+        }
+
+        @keyframes luxAuroraShift {
+          0% {
+            transform: translate3d(0, 0, 0) scale(1);
+            filter: saturate(1);
+          }
+          100% {
+            transform: translate3d(0, -8px, 0) scale(1.04);
+            filter: saturate(1.12);
+          }
+        }
+
+        @keyframes luxGridShift {
+          0% {
+            background-position: 0 0, 0 0;
+          }
+          100% {
+            background-position: 52px 0, 0 52px;
+          }
+        }
+
+        @keyframes luxOrbDrift {
+          0%,
+          100% {
+            transform: translate3d(0, 0, 0);
+          }
+          50% {
+            transform: translate3d(18px, -14px, 0);
+          }
+        }
+
+        @keyframes luxShimmer {
+          0%,
+          70%,
+          100% {
+            transform: translateX(-110%);
+          }
+          85% {
+            transform: translateX(110%);
+          }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .lux-aurora,
+          .lux-grid,
+          .lux-orb,
+          .lux-panel::after,
+          .lux-float-in {
+            animation: none !important;
+          }
+
+          button,
+          .lux-card {
+            transition: none !important;
+          }
+        }
+
+        .meme-text {
+          font-family: Impact, Haettenschweiler, "Arial Narrow Bold", sans-serif;
+          font-size: clamp(1rem, 2vw, 1.5rem);
+          line-height: 1.05;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: #fff;
+          text-shadow:
+            -2px -2px 0 #000,
+            2px -2px 0 #000,
+            -2px 2px 0 #000,
+            2px 2px 0 #000,
+            0 3px 6px rgba(0, 0, 0, 0.75);
+          word-break: break-word;
         }
       `}</style>
     </main>
