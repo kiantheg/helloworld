@@ -778,13 +778,12 @@ export default function Home() {
       let changed = false;
 
       if (!existingVote) {
-        const now = new Date().toISOString();
         const { error: insertError } = await supabase.from("caption_votes").insert({
           caption_id: captionId,
           profile_id: profileId,
           vote_value: voteValue,
-          created_datetime_utc: now,
-          modified_datetime_utc: now,
+          created_by_user_id: profileId,
+          modified_by_user_id: profileId,
         });
 
         if (insertError) {
@@ -796,7 +795,7 @@ export default function Home() {
       } else if (existingVote.vote_value !== voteValue) {
         const { error: updateError } = await supabase
           .from("caption_votes")
-          .update({ vote_value: voteValue, modified_datetime_utc: new Date().toISOString() })
+          .update({ vote_value: voteValue, modified_by_user_id: profileId })
           .eq("id", existingVote.id);
 
         if (updateError) {
@@ -874,7 +873,7 @@ export default function Home() {
         .from("caption_votes")
         .update({
           vote_value: previousVote,
-          modified_datetime_utc: new Date().toISOString(),
+          modified_by_user_id: profileId,
         })
         .eq("id", current.id);
 
@@ -883,13 +882,12 @@ export default function Home() {
         return;
       }
     } else {
-      const now = new Date().toISOString();
       const { error: insertError } = await supabase.from("caption_votes").insert({
         caption_id: captionId,
         profile_id: profileId,
         vote_value: previousVote,
-        created_datetime_utc: now,
-        modified_datetime_utc: now,
+        created_by_user_id: profileId,
+        modified_by_user_id: profileId,
       });
       if (insertError) {
         setError(insertError.message);
