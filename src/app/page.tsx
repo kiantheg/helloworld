@@ -56,6 +56,7 @@ type GenerateCaptionsResponseRow = {
 const LOAD_BATCH_SIZE = 60;
 const UPLOAD_HISTORY_LIMIT = 60;
 const PIPELINE_API_BASE = "https://api.almostcrackd.ai";
+const SHORTCUT_HINT_DISMISSED_KEY = "caption-studio-shortcut-hint-dismissed";
 const SUPPORTED_UPLOAD_TYPES = new Set([
   "image/jpeg",
   "image/jpg",
@@ -83,7 +84,6 @@ const readStoredPrefs = () => {
       viewMode?: "stage" | "wall";
       sortMode?: "top" | "new";
       showShortcuts?: boolean;
-      focusMode?: boolean;
     };
   } catch {
     return null;
@@ -141,43 +141,10 @@ const relativeTime = (value: string | null) => {
   return `${Math.floor(hours / 24)}d ago`;
 };
 
+const formatNetScore = (score: number) => (score > 0 ? `+${score}` : `${score}`);
+
 const getCreatedTime = (caption: CaptionRow) =>
   new Date(caption.created_datetime_utc ?? 0).getTime();
-
-const getImageGroupKey = (caption: CaptionRow) => caption.image_id ?? `caption-${caption.id}`;
-
-const diversifyByImage = (
-  rows: CaptionRow[],
-  rankValue: (caption: CaptionRow) => number
-) => {
-  const buckets = new Map<string, CaptionRow[]>();
-
-  rows.forEach((caption) => {
-    const key = getImageGroupKey(caption);
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key)!.push(caption);
-  });
-
-  const sortedBuckets = Array.from(buckets.values()).map((bucket) =>
-    [...bucket].sort((a, b) => rankValue(b) - rankValue(a))
-  );
-
-  sortedBuckets.sort((a, b) => rankValue(b[0]) - rankValue(a[0]));
-
-  const mixed: CaptionRow[] = [];
-  let addedInPass = true;
-  while (addedInPass) {
-    addedInPass = false;
-    for (const bucket of sortedBuckets) {
-      const next = bucket.shift();
-      if (!next) continue;
-      mixed.push(next);
-      addedInPass = true;
-    }
-  }
-
-  return mixed;
-};
 
 export default function Home() {
   const [loading, setLoading] = useState(Boolean(supabase));
@@ -219,26 +186,43 @@ export default function Home() {
     const stored = readStoredPrefs();
     return Boolean(stored?.showShortcuts);
   });
-  const [showOptions, setShowOptions] = useState(false);
-  const [focusMode, setFocusMode] = useState(() => {
-    const stored = readStoredPrefs();
-    return Boolean(stored?.focusMode);
-  });
   const [stageTransitioning, setStageTransitioning] = useState(false);
   const [undoState, setUndoState] = useState<UndoState | null>(null);
   const [reactionPulseCaptionId, setReactionPulseCaptionId] = useState<string | null>(null);
+  const [shortcutHintDismissed, setShortcutHintDismissed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(SHORTCUT_HINT_DISMISSED_KEY) === "true";
+  });
+  const [ratingSearchQuery, setRatingSearchQuery] = useState("");
   const stageSwapTimerRef = useRef<number | null>(null);
   const stageFadeTimerRef = useRef<number | null>(null);
   const undoTimerRef = useRef<number | null>(null);
   const reactionPulseTimerRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const keyboardBindingsRef = useRef<{
+    activeCaption: CaptionRow | null;
+    moveActive: (direction: 1 | -1) => void;
+    pickRandom: () => void;
+    submitVote: (captionId: string, voteValue: 1 | -1, advanceToNext?: boolean) => Promise<void>;
+    undoLastReaction: () => Promise<void>;
+    viewMode: "stage" | "wall";
+    workspaceView: "rating" | "upload";
+  } | null>(null);
 
   useEffect(() => {
     window.localStorage.setItem(
       "caption-studio-prefs",
-      JSON.stringify({ viewMode, sortMode, showShortcuts, focusMode })
+      JSON.stringify({ viewMode, sortMode, showShortcuts })
     );
-  }, [focusMode, showShortcuts, sortMode, viewMode]);
+  }, [showShortcuts, sortMode, viewMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      SHORTCUT_HINT_DISMISSED_KEY,
+      shortcutHintDismissed ? "true" : "false"
+    );
+  }, [shortcutHintDismissed]);
 
   const loadBoardData = useCallback(
     async (userId: string) => {
@@ -637,6 +621,10 @@ export default function Home() {
     async (event: ChangeEvent<HTMLInputElement>) => {
       const file = event.target.files?.[0];
       if (!file) return;
+      setGeneratedPreviewImageUrl(URL.createObjectURL(file));
+      setUploadStatus(`Selected ${file.name}. Uploading...`);
+      setLastGeneratedCaptions([]);
+      setGeneratedCaptionIndex(0);
       await uploadFileAndGenerate(file);
       event.target.value = "";
     },
@@ -659,6 +647,10 @@ export default function Home() {
       setDragActive(false);
       const file = event.dataTransfer.files?.[0];
       if (!file) return;
+      setGeneratedPreviewImageUrl(URL.createObjectURL(file));
+      setUploadStatus(`Selected ${file.name}. Uploading...`);
+      setLastGeneratedCaptions([]);
+      setGeneratedCaptionIndex(0);
       await uploadFileAndGenerate(file);
     },
     [uploadFileAndGenerate]
@@ -667,22 +659,33 @@ export default function Home() {
   const sortedCaptions = useMemo(() => {
     const list = [...captions];
     if (sortMode === "new") {
-      return diversifyByImage(list, (caption) => getCreatedTime(caption));
+      return list.sort((a, b) => getCreatedTime(b) - getCreatedTime(a));
     }
 
-    return diversifyByImage(
-      list,
-      (caption) => (rankScoreByCaption[caption.id] ?? 0) * 10000000000000 + getCreatedTime(caption)
-    );
+    return list.sort((a, b) => {
+      const scoreDiff = (rankScoreByCaption[b.id] ?? 0) - (rankScoreByCaption[a.id] ?? 0);
+      if (scoreDiff !== 0) return scoreDiff;
+      return getCreatedTime(b) - getCreatedTime(a);
+    });
   }, [captions, rankScoreByCaption, sortMode]);
+
+  const filteredCaptions = useMemo(() => {
+    const query = ratingSearchQuery.trim().toLowerCase();
+    if (!query) return sortedCaptions;
+    return sortedCaptions.filter((caption) => {
+      const content = caption.content?.toLowerCase() ?? "";
+      const createdAt = caption.created_datetime_utc?.toLowerCase() ?? "";
+      return content.includes(query) || createdAt.includes(query);
+    });
+  }, [ratingSearchQuery, sortedCaptions]);
 
   const activeIndex = useMemo(() => {
     if (!activeCaptionId) return 0;
-    const idx = sortedCaptions.findIndex((c) => c.id === activeCaptionId);
+    const idx = filteredCaptions.findIndex((c) => c.id === activeCaptionId);
     return idx >= 0 ? idx : 0;
-  }, [activeCaptionId, sortedCaptions]);
+  }, [activeCaptionId, filteredCaptions]);
 
-  const activeCaption = sortedCaptions[activeIndex] ?? null;
+  const activeCaption = filteredCaptions[activeIndex] ?? null;
 
   const focusCaption = useCallback(
     (nextCaptionId: string) => {
@@ -707,30 +710,30 @@ export default function Home() {
   );
 
   const queueCaptions = useMemo(() => {
-    if (sortedCaptions.length <= 1) return [];
+    if (filteredCaptions.length <= 1) return [];
     const next: CaptionRow[] = [];
-    for (let i = 1; i <= Math.min(4, sortedCaptions.length - 1); i += 1) {
-      const idx = (activeIndex + i) % sortedCaptions.length;
-      next.push(sortedCaptions[idx]);
+    for (let i = 1; i <= Math.min(4, filteredCaptions.length - 1); i += 1) {
+      const idx = (activeIndex + i) % filteredCaptions.length;
+      next.push(filteredCaptions[idx]);
     }
     return next;
-  }, [activeIndex, sortedCaptions]);
+  }, [activeIndex, filteredCaptions]);
 
   const moveActive = useCallback(
     (direction: 1 | -1) => {
-      if (sortedCaptions.length === 0) return;
+      if (filteredCaptions.length === 0) return;
       const nextIndex =
-        (activeIndex + direction + sortedCaptions.length) % sortedCaptions.length;
-      focusCaption(sortedCaptions[nextIndex].id);
+        (activeIndex + direction + filteredCaptions.length) % filteredCaptions.length;
+      focusCaption(filteredCaptions[nextIndex].id);
     },
-    [activeIndex, focusCaption, sortedCaptions]
+    [activeIndex, filteredCaptions, focusCaption]
   );
 
   const pickRandom = useCallback(() => {
-    if (sortedCaptions.length === 0) return;
-    const idx = Math.floor(Math.random() * sortedCaptions.length);
-    focusCaption(sortedCaptions[idx].id);
-  }, [focusCaption, sortedCaptions]);
+    if (filteredCaptions.length === 0) return;
+    const idx = Math.floor(Math.random() * filteredCaptions.length);
+    focusCaption(filteredCaptions[idx].id);
+  }, [filteredCaptions, focusCaption]);
 
   useEffect(() => {
     return () => {
@@ -751,9 +754,9 @@ export default function Home() {
       }
 
       const shouldAdvance =
-        advanceToNext && captionId === activeCaptionId && sortedCaptions.length > 1;
+        advanceToNext && captionId === activeCaptionId && filteredCaptions.length > 1;
       const nextCaptionId = shouldAdvance
-        ? sortedCaptions[(activeIndex + 1) % sortedCaptions.length].id
+        ? filteredCaptions[(activeIndex + 1) % filteredCaptions.length].id
         : null;
 
       setError(null);
@@ -824,8 +827,20 @@ export default function Home() {
       setSubmittingCaptionId(null);
       if (nextCaptionId) focusCaption(nextCaptionId);
     },
-    [activeCaptionId, activeIndex, focusCaption, profileId, sortedCaptions]
+    [activeCaptionId, activeIndex, filteredCaptions, focusCaption, profileId]
   );
+
+  useEffect(() => {
+    if (filteredCaptions.length === 0) {
+      setActiveCaptionId(null);
+      return;
+    }
+
+    setActiveCaptionId((prev) => {
+      if (prev && filteredCaptions.some((caption) => caption.id === prev)) return prev;
+      return filteredCaptions[0]?.id ?? null;
+    });
+  }, [filteredCaptions]);
 
   const undoLastReaction = useCallback(async () => {
     if (!supabase || !profileId || !undoState) return;
@@ -899,6 +914,18 @@ export default function Home() {
   }, [profileId, undoState]);
 
   useEffect(() => {
+    keyboardBindingsRef.current = {
+      activeCaption,
+      moveActive,
+      pickRandom,
+      submitVote,
+      undoLastReaction,
+      viewMode,
+      workspaceView,
+    };
+  }, [activeCaption, moveActive, pickRandom, submitVote, undoLastReaction, viewMode, workspaceView]);
+
+  useEffect(() => {
     const isTypingTarget = (target: EventTarget | null) => {
       if (!(target instanceof HTMLElement)) return false;
       const tag = target.tagName.toLowerCase();
@@ -908,38 +935,46 @@ export default function Home() {
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
+      const bindings = keyboardBindingsRef.current;
+      if (!bindings) return;
+
       if (isTypingTarget(event.target)) return;
-      if (workspaceView !== "rating") return;
+      if (bindings.workspaceView !== "rating") return;
       if (event.key === "?") {
         event.preventDefault();
         setShowShortcuts((prev) => !prev);
         return;
       }
+      if (event.key.toLowerCase() === "u") {
+        event.preventDefault();
+        void bindings.undoLastReaction();
+        return;
+      }
 
-      if (viewMode !== "stage" || !activeCaption) return;
+      if (bindings.viewMode !== "stage" || !bindings.activeCaption) return;
 
       const key = event.key.toLowerCase();
-      if (event.key === "ArrowRight") {
+      if (event.key === "ArrowUp") {
         event.preventDefault();
-        moveActive(1);
+        void bindings.submitVote(bindings.activeCaption.id, 1, true);
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        void bindings.submitVote(bindings.activeCaption.id, -1, true);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        bindings.moveActive(1);
       } else if (event.key === "ArrowLeft") {
         event.preventDefault();
-        moveActive(-1);
-      } else if (key === "l") {
-        event.preventDefault();
-        void submitVote(activeCaption.id, 1, true);
-      } else if (key === "d") {
-        event.preventDefault();
-        void submitVote(activeCaption.id, -1, true);
+        bindings.moveActive(-1);
       } else if (key === "r") {
         event.preventDefault();
-        pickRandom();
+        bindings.pickRandom();
       }
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeCaption, moveActive, pickRandom, submitVote, viewMode, workspaceView]);
+  }, []);
 
   const renderImagePanel = (caption: CaptionRow, variant: ImageVariant) => {
     const imageUrl = getCaptionImageUrl(caption);
@@ -998,6 +1033,22 @@ export default function Home() {
     img.src = nextImageUrl;
   }, [queueCaptions, viewMode]);
 
+  const selectedUploadHistory =
+    uploadHistory.find((item) => item.imageId === selectedHistoryImageId) ?? uploadHistory[0] ?? null;
+
+  useEffect(() => {
+    if (!selectedUploadHistory) return;
+
+    setGeneratedPreviewImageUrl(selectedUploadHistory.imageUrl ?? null);
+    setLastGeneratedCaptions(
+      selectedUploadHistory.captions
+        .map((caption) => caption.content?.trim() ?? "")
+        .filter((caption): caption is string => Boolean(caption))
+    );
+    setGeneratedCaptionIndex(0);
+    setUploadStatus(null);
+  }, [selectedUploadHistory]);
+
   if (loading) {
     return (
       <main className="min-h-screen bg-[#080f22] p-8 text-slate-100">
@@ -1009,35 +1060,37 @@ export default function Home() {
   const modeTitle = viewMode === "stage" ? "Stage And Queue" : "Poster Wall";
   const modeDescription =
     viewMode === "stage"
-      ? "One active caption on stage. A live queue to the side. React with Like or Dislike and keep the show moving."
-      : "A stylized board of caption posters. React directly here or send any card to Stage mode.";
+      ? "Review one caption at a time, keep reactions obvious, and jump ahead from the next-up list."
+      : "Browse the board, react directly on each card, or open any post in stage view.";
   const accentPrimary =
     viewMode === "stage"
       ? "border-emerald-300/40 bg-emerald-400/12 text-emerald-100"
       : "border-cyan-300/40 bg-cyan-400/12 text-cyan-100";
-  const selectedUploadHistory =
-    uploadHistory.find((item) => item.imageId === selectedHistoryImageId) ?? uploadHistory[0] ?? null;
   const generatedCaptionText =
     lastGeneratedCaptions[generatedCaptionIndex] ??
     lastGeneratedCaptions[0] ??
     "Generate captions to preview in meme format.";
+  const activeVote = activeCaption ? myVotes[activeCaption.id] ?? 0 : 0;
+  const activeScore = activeCaption ? rankScoreByCaption[activeCaption.id] ?? 0 : 0;
+  const filteredCountLabel =
+    filteredCaptions.length === sortedCaptions.length
+      ? `${sortedCaptions.length} ready`
+      : `${filteredCaptions.length}/${sortedCaptions.length} ready`;
 
   return (
     <main className="lux-root min-h-screen bg-[#080f22] text-slate-100">
-      <div className="lux-aurora pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_7%_15%,rgba(251,191,36,0.16),transparent_36%),radial-gradient(circle_at_88%_8%,rgba(16,185,129,0.15),transparent_35%),radial-gradient(circle_at_50%_92%,rgba(56,189,248,0.16),transparent_40%)]" />
-      <div className="lux-grid pointer-events-none absolute inset-0 opacity-35 bg-[linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:52px_52px]" />
-      <div className="lux-noise pointer-events-none absolute inset-0" />
-      <div className="lux-orb lux-orb-a pointer-events-none absolute -top-10 -left-10 h-64 w-64 rounded-full" />
-      <div className="lux-orb lux-orb-b pointer-events-none absolute top-20 right-0 h-72 w-72 rounded-full" />
+      <div className="lux-aurora pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_7%_15%,rgba(251,191,36,0.16),transparent_36%),radial-gradient(circle_at_88%_8%,rgba(16,185,129,0.15),transparent_35%),radial-gradient(circle_at_50%_92%,rgba(56,189,248,0.16),transparent_40%)]" />
+      <div className="lux-grid pointer-events-none fixed inset-0 opacity-35 bg-[linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:52px_52px]" />
+      <div className="lux-noise pointer-events-none fixed inset-0" />
+      <div className="lux-orb lux-orb-a pointer-events-none fixed -top-10 -left-10 h-64 w-64 rounded-full" />
+      <div className="lux-orb lux-orb-b pointer-events-none fixed top-20 right-0 h-72 w-72 rounded-full" />
 
       <div className="relative mx-auto max-w-7xl px-4 py-8 sm:px-8">
         <header
-          className={`lux-panel lux-float-in relative z-30 mb-8 rounded-[30px] border bg-[#0f1a37]/70 p-6 backdrop-blur-xl ${
-            focusMode ? "border-white/5 opacity-80" : "border-white/10"
-          }`}
+          className="lux-panel lux-float-in relative z-30 mb-8 rounded-[30px] border border-white/10 bg-[#0f1a37]/70 p-6 backdrop-blur-xl"
         >
-          <div className="flex flex-wrap items-center justify-between gap-4">
-            <div>
+          <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
+            <div className="max-w-3xl">
               <p className="text-[0.65rem] uppercase tracking-[0.45em] text-emerald-200/80">
                 Caption Studio
               </p>
@@ -1049,56 +1102,45 @@ export default function Home() {
               </p>
             </div>
 
-            <div className="relative flex items-center gap-3">
-              <div className={`rounded-full border px-4 py-2 text-xs uppercase tracking-[0.2em] ${accentPrimary}`}>
-                {sortedCaptions.length} loaded
-              </div>
-              <button
-                onClick={() => setLoadedCount((prev) => prev + LOAD_BATCH_SIZE)}
-                className="rounded-full border border-cyan-200/35 bg-cyan-400/10 px-4 py-2 text-xs uppercase tracking-[0.18em] text-cyan-100 transition hover:bg-cyan-400/20"
-              >
-                Load {LOAD_BATCH_SIZE} More
-              </button>
-              <button
-                onClick={() => setShowOptions((prev) => !prev)}
-                className="rounded-full border border-white/20 bg-black/25 px-4 py-2 text-xs uppercase tracking-[0.18em] text-slate-200 transition hover:bg-white/10"
-              >
-                Options
-              </button>
-              <button
-                onClick={async () => {
-                  if (!supabase) return;
-                  await supabase.auth.signOut();
-                  window.location.assign("/login");
-                }}
-                className="rounded-full border border-white/20 bg-slate-950/70 px-5 py-2.5 text-sm text-slate-100 transition hover:bg-slate-900"
-              >
-                Sign out
-              </button>
-
-              {showOptions && (
-                <div className="absolute right-0 top-12 z-[120] w-64 rounded-2xl border border-white/15 bg-[#0a1229]/95 p-3 text-xs shadow-[0_20px_45px_rgba(2,6,23,0.55)] backdrop-blur">
-                  <button
-                    onClick={() => setShowShortcuts((prev) => !prev)}
-                    className="mb-2 w-full rounded-xl border border-violet-200/30 px-3 py-2 text-left text-violet-100 hover:bg-violet-400/10"
-                  >
-                    {showShortcuts ? "Hide" : "Show"} shortcuts
-                  </button>
-                  <button
-                    onClick={() => setFocusMode((prev) => !prev)}
-                    className="mb-2 w-full rounded-xl border border-slate-200/20 px-3 py-2 text-left text-slate-200 hover:bg-white/10"
-                  >
-                    {focusMode ? "Disable" : "Enable"} focus mode
-                  </button>
-                  <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-[11px] uppercase tracking-[0.16em] text-slate-300">
-                    {sortMode === "top" ? "Top (de-clumped)" : "New (de-clumped)"}
-                  </p>
+            <div className="flex flex-wrap items-center justify-end gap-2 xl:max-w-[520px]">
+              <div className="flex flex-wrap gap-2">
+                <div
+                  className={`rounded-2xl border px-4 py-3 text-center text-sm font-medium ${accentPrimary}`}
+                >
+                  {filteredCountLabel}
                 </div>
-              )}
+                <button
+                  onClick={() => setLoadedCount((prev) => prev + LOAD_BATCH_SIZE)}
+                  className="rounded-2xl border border-cyan-200/35 bg-cyan-400/10 px-4 py-3 text-center text-sm font-medium text-cyan-100 transition hover:bg-cyan-400/20"
+                  title={`Load ${LOAD_BATCH_SIZE} more captions`}
+                >
+                  Load More
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => setShowShortcuts((prev) => !prev)}
+                  className="rounded-2xl border border-white/20 bg-black/25 px-4 py-3 text-center text-sm font-medium text-slate-200 transition hover:bg-white/10"
+                  title="Show or hide shortcuts"
+                >
+                  {showShortcuts ? "Hide Shortcuts" : "Show Shortcuts"}
+                </button>
+                <button
+                  onClick={async () => {
+                    if (!supabase) return;
+                    await supabase.auth.signOut();
+                    window.location.assign("/login");
+                  }}
+                  className="rounded-2xl border border-white/20 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 transition hover:bg-slate-900"
+                >
+                  Sign out
+                </button>
+              </div>
             </div>
           </div>
 
-          <div className={`mt-5 flex flex-wrap items-center gap-3 text-xs ${focusMode ? "opacity-60" : ""}`}>
+          <div className="mt-5 grid gap-3 text-xs">
+            <div className="flex flex-wrap items-center gap-3">
             <div className="inline-flex rounded-full border border-white/15 bg-black/20 p-1">
               <button
                 onClick={() => setWorkspaceView("rating")}
@@ -1176,23 +1218,39 @@ export default function Home() {
               onClick={pickRandom}
               disabled={workspaceView !== "rating"}
               className="lux-glow-btn rounded-full border border-amber-200/35 px-4 py-2 text-amber-100 hover:bg-amber-400/10"
+              title="Jump to a random caption"
             >
               Surprise Me
             </button>
-            <span className="rounded-full border border-white/15 bg-white/5 px-4 py-2 uppercase tracking-[0.2em] text-slate-300">
-              {viewMode === "stage" ? "Stage nav: ← →" : "Wall browse"}
-            </span>
+            </div>
+
+            {workspaceView === "rating" && (
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="flex min-w-[240px] flex-1 items-center gap-2 rounded-2xl border border-white/15 bg-black/20 px-3 py-2.5 text-slate-300">
+                  <span className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Filter</span>
+                  <input
+                    value={ratingSearchQuery}
+                    onChange={(event) => setRatingSearchQuery(event.target.value)}
+                    placeholder="Search captions"
+                    className="w-full bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                  />
+                </label>
+                <span className="rounded-2xl border border-white/15 bg-white/5 px-4 py-2.5 uppercase tracking-[0.16em] text-slate-300">
+                  {viewMode === "stage" ? "Stage: Left/right browse, up/down react" : "Wall: Click a card to open stage"}
+                </span>
+              </div>
+            )}
           </div>
         </header>
 
         {workspaceView === "upload" && (
-          <section className="lux-float-in mb-6 grid gap-5 xl:grid-cols-[1.25fr_1fr]">
-          <article className="lux-card rounded-[24px] border border-white/10 bg-[#0f1935]/75 p-5 shadow-[0_18px_42px_rgba(2,6,23,0.4)]">
+          <section className="lux-float-in relative mb-6 grid gap-5 rounded-[28px] bg-[#0b1430]/70 p-1 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
+          <article className="lux-card min-w-0 rounded-[24px] border border-white/10 bg-[#0f1935]/75 p-5 shadow-[0_18px_42px_rgba(2,6,23,0.4)]">
             <p className="text-[0.62rem] uppercase tracking-[0.3em] text-cyan-200/80">
               Upload Image
             </p>
             <p className="mt-2 text-sm text-slate-300">
-              Upload from your computer, drop a file here, or paste an image link.
+              Upload from your computer, drop a file here, or paste an image link. The preview updates immediately so you can confirm the upload started.
             </p>
             <label className="mt-3 inline-flex items-center gap-2 rounded-full border border-white/15 bg-black/20 px-3 py-1.5 text-xs text-slate-200">
               <input
@@ -1227,6 +1285,7 @@ export default function Home() {
               }`}
             >
               <p className="text-sm text-slate-200">Drag and drop image file here</p>
+              <p className="mt-1 text-xs text-slate-400">PNG, JPG, WEBP, GIF, or HEIC</p>
               <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={uploadBusy}
@@ -1255,7 +1314,7 @@ export default function Home() {
             </div>
 
             {uploadStatus && (
-              <p className="mt-3 text-xs text-cyan-200/90">Status: {uploadStatus}</p>
+              <p className="mt-3 rounded-lg border border-cyan-300/25 bg-cyan-400/10 px-3 py-2 text-xs text-cyan-100">Status: {uploadStatus}</p>
             )}
             {uploadError && (
               <p className="mt-3 rounded-lg border border-rose-300/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
@@ -1302,7 +1361,7 @@ export default function Home() {
                 </div>
               ) : (
                 <div className="flex h-80 items-center justify-center rounded-lg border border-white/10 bg-[#050a18] text-xs text-slate-400">
-                  Upload/select an image to start meme preview.
+                  Upload or select an image to start the preview.
                 </div>
               )}
 
@@ -1338,7 +1397,7 @@ export default function Home() {
             </div>
           </article>
 
-          <article className="lux-card rounded-[24px] border border-white/10 bg-[#0f1935]/75 p-5 shadow-[0_18px_42px_rgba(2,6,23,0.4)]">
+          <article className="lux-card min-w-0 rounded-[24px] border border-white/10 bg-[#0f1935]/75 p-5 shadow-[0_18px_42px_rgba(2,6,23,0.4)]">
             <div className="flex items-center justify-between gap-3">
               <p className="text-[0.62rem] uppercase tracking-[0.3em] text-amber-200/80">
                 Your Upload History
@@ -1361,8 +1420,8 @@ export default function Home() {
                       : "border-white/10"
                   }`}
                 >
-                  <div className="grid grid-cols-[140px_1fr] gap-3">
-                    <div className="h-28 overflow-hidden rounded-lg bg-[#050a18]">
+                  <div className="grid grid-cols-[96px_1fr] gap-3 sm:grid-cols-[120px_1fr]">
+                    <div className="h-24 overflow-hidden rounded-lg bg-[#050a18] sm:h-28">
                       {item.imageUrl ? (
                         // eslint-disable-next-line @next/next/no-img-element
                         <img
@@ -1481,7 +1540,30 @@ export default function Home() {
             <p className="text-[0.62rem] uppercase tracking-[0.3em] text-violet-200/90">
               Shortcuts
             </p>
-            <p className="mt-2">`L` like, `D` dislike, `R` random, `←/→` navigate, `?` toggle this panel.</p>
+            <p className="mt-2">`↑/↓` react, `←/→` browse, `R` random, `?` toggle help.</p>
+          </div>
+        )}
+
+        {workspaceView === "rating" && !shortcutHintDismissed && (
+          <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-cyan-200/25 bg-cyan-400/10 p-4 text-sm text-cyan-50 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-[0.62rem] uppercase tracking-[0.3em] text-cyan-200/90">Quick keys</p>
+              <p className="mt-1 text-cyan-50/90">`↑` Like, `↓` Dislike, `←/→` Browse, `R` Random, `?` Help.</p>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowShortcuts(true)}
+                className="rounded-full border border-cyan-200/40 px-3 py-1.5 text-xs font-medium text-cyan-50 hover:bg-cyan-300/10"
+              >
+                Show help
+              </button>
+              <button
+                onClick={() => setShortcutHintDismissed(true)}
+                className="rounded-full border border-white/20 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-white/10"
+              >
+                Dismiss
+              </button>
+            </div>
           </div>
         )}
 
@@ -1500,56 +1582,85 @@ export default function Home() {
         )}
 
         {workspaceView === "rating" && (viewMode === "stage" && activeCaption ? (
-          <section className="lux-float-in grid gap-5 xl:grid-cols-[220px_1fr_300px]">
+          <section className="lux-float-in grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="grid gap-5">
             <aside className="lux-card rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
-              {!focusMode && (
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <p className="text-[0.62rem] uppercase tracking-[0.3em] text-sky-200/80">
-                  Reaction Panel
+                  Current Caption
                 </p>
-              )}
-              <div className={`${focusMode ? "mt-0" : "mt-4"} space-y-3`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <div
+                    className={`rounded-full border px-3 py-1 text-[11px] uppercase tracking-[0.16em] ${
+                      sortMode === "top"
+                        ? "border-emerald-300/30 bg-emerald-400/10 text-emerald-100"
+                        : "border-white/10 bg-black/20 text-slate-300"
+                    }`}
+                  >
+                    Score {formatNetScore(activeScore)}
+                  </div>
+                  <div className="rounded-full border border-white/10 bg-black/20 px-3 py-1 text-[11px] uppercase tracking-[0.16em] text-slate-300">
+                    Item {activeIndex + 1} of {filteredCaptions.length}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 grid gap-3 md:grid-cols-[1fr_1fr_auto]">
                 <button
                   aria-label="Like caption"
                   onClick={() => submitVote(activeCaption.id, 1, true)}
                   disabled={submittingCaptionId === activeCaption.id}
-                  className={`w-full rounded-2xl border px-3 py-4 text-sm font-semibold transition duration-200 ${
+                  title="Like this caption and move to the next one"
+                  className={`w-full rounded-2xl border px-3 py-4 text-left text-sm font-semibold transition duration-200 ${
                     (myVotes[activeCaption.id] ?? 0) === 1
                       ? "border-emerald-300 bg-emerald-400/25 text-emerald-100"
                       : "border-emerald-300/50 text-emerald-100 hover:bg-emerald-500/15"
                   } ${reactionPulseCaptionId === activeCaption.id ? "ring-2 ring-emerald-300/55" : ""} disabled:opacity-50`}
                 >
-                  Like
+                  <span className="block">Like</span>
+                  <span className="mt-1 block text-xs font-normal text-emerald-100/75">
+                    Save positive vote, then continue
+                  </span>
                 </button>
                 <button
                   aria-label="Dislike caption"
                   onClick={() => submitVote(activeCaption.id, -1, true)}
                   disabled={submittingCaptionId === activeCaption.id}
-                  className={`w-full rounded-2xl border px-3 py-4 text-sm font-semibold transition duration-200 ${
+                  title="Dislike this caption and move to the next one"
+                  className={`w-full rounded-2xl border px-3 py-4 text-left text-sm font-semibold transition duration-200 ${
                     (myVotes[activeCaption.id] ?? 0) === -1
                       ? "border-rose-300 bg-rose-400/25 text-rose-100"
                       : "border-rose-300/50 text-rose-100 hover:bg-rose-500/15"
                   } ${reactionPulseCaptionId === activeCaption.id ? "ring-2 ring-rose-300/50" : ""} disabled:opacity-50`}
                 >
-                  Dislike
+                  <span className="block">Dislike</span>
+                  <span className="mt-1 block text-xs font-normal text-rose-100/75">
+                    Save negative vote, then continue
+                  </span>
                 </button>
+                <div className="grid gap-2 text-xs">
+                  <button
+                    onClick={() => moveActive(-1)}
+                    title="Go back to the previous caption"
+                    className="rounded-xl border border-white/20 px-3 py-2 transition duration-150 hover:bg-white/10"
+                  >
+                    Back
+                  </button>
+                  <button
+                    onClick={() => moveActive(1)}
+                    title="Skip to the next caption without voting"
+                    className="rounded-xl border border-white/20 px-3 py-2 transition duration-150 hover:bg-white/10"
+                  >
+                    Skip
+                  </button>
+                </div>
               </div>
-
-              <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
-                <button
-                  onClick={() => moveActive(-1)}
-                  className="rounded-xl border border-white/20 px-3 py-2 transition duration-150 hover:bg-white/10"
-                >
-                  Previous
-                </button>
-                <button
-                  onClick={() => moveActive(1)}
-                  className="rounded-xl border border-white/20 px-3 py-2 transition duration-150 hover:bg-white/10"
-                >
-                  Next
-                </button>
-              </div>
-              <div className="mt-3 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-center text-[0.68rem] uppercase tracking-[0.2em] text-slate-300">
-                Item {activeIndex + 1} of {sortedCaptions.length}
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-300">
+                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5">
+                  {activeVote === 1 ? "You liked this caption" : activeVote === -1 ? "You disliked this caption" : "No reaction saved yet"}
+                </span>
+                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5">
+                  `←/→` browse · `↑/↓` react
+                </span>
               </div>
             </aside>
 
@@ -1564,12 +1675,8 @@ export default function Home() {
                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#060b18]/90 via-[#060b18]/45 to-transparent p-4">
                   <div className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-black/35 px-3 py-1 text-xs text-slate-200">
                     <span>{relativeTime(activeCaption.created_datetime_utc)}</span>
-                    {!focusMode && (
-                      <>
-                        <span className="h-1 w-1 rounded-full bg-slate-300" />
-                        <span>Arrow keys to navigate</span>
-                      </>
-                    )}
+                    <span className="h-1 w-1 rounded-full bg-slate-300" />
+                    <span>Left/right browse, up/down react</span>
                   </div>
                 </div>
               </div>
@@ -1578,6 +1685,23 @@ export default function Home() {
                 <p className="rounded-[22px] border border-white/10 bg-[#0a1229]/75 px-5 py-4 text-[1.05rem] leading-relaxed text-slate-100">
                   {activeCaption.content ?? "No caption text."}
                 </p>
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-slate-300">
+                    Content
+                  </span>
+                  <span
+                    className={`rounded-full border px-3 py-1.5 ${
+                      sortMode === "top"
+                        ? "border-emerald-300/30 bg-emerald-400/10 text-emerald-100"
+                        : "border-white/10 bg-black/20 text-slate-300"
+                    }`}
+                  >
+                    Net score {formatNetScore(activeScore)}
+                  </span>
+                  <span className="rounded-full border border-cyan-200/20 bg-cyan-400/10 px-3 py-1.5 text-cyan-100">
+                    Reactions apply to this image + caption pair
+                  </span>
+                </div>
                 {submittingCaptionId === activeCaption.id && (
                   <p aria-live="polite" className="mt-3 text-xs text-slate-400">
                     Saving reaction...
@@ -1585,33 +1709,29 @@ export default function Home() {
                 )}
               </div>
             </article>
+            </div>
 
             <aside className="lux-card rounded-[26px] border border-white/10 bg-[#101c3b]/78 p-4 shadow-[0_10px_28px_rgba(2,6,23,0.35)]">
-              {!focusMode && (
-                <div className="flex items-center justify-between">
-                  <p className="text-[0.62rem] uppercase tracking-[0.3em] text-amber-200/80">
-                    Upcoming Queue
-                  </p>
-                  <span className="text-[11px] text-slate-400">tap to jump</span>
-                </div>
-              )}
+              <div className="flex items-center justify-between">
+                <p className="text-[0.62rem] uppercase tracking-[0.3em] text-amber-200/80">
+                  Next Up
+                </p>
+                <span className="text-[11px] text-slate-400">click to jump</span>
+              </div>
 
-              <div className={`relative ${focusMode ? "mt-0" : "mt-4"} h-[420px]`}>
+              <div className="mt-4 space-y-3">
                 {queueCaptions.map((caption, index) => {
-                  const tilt = [-4, 5, -3, 4][index] ?? 0;
                   return (
                     <button
                       key={`queue-${caption.id}`}
                       onClick={() => focusCaption(caption.id)}
-                      className={`lux-float-in absolute left-0 w-full overflow-hidden rounded-2xl border bg-[#0b142d] text-left transition duration-220 ${
+                      title={`Jump to upcoming caption ${index + 1}`}
+                      className={`lux-float-in w-full overflow-hidden rounded-2xl border bg-[#0b142d] text-left transition duration-220 ${
                         caption.id === activeCaption.id
                           ? "border-cyan-300/60 shadow-[0_0_0_1px_rgba(103,232,249,0.45)]"
                           : "border-white/15 hover:border-sky-200/50"
                       }`}
                       style={{
-                        top: `${index * 82}px`,
-                        transform: `rotate(${tilt}deg)`,
-                        zIndex: 10 - index,
                         animationDelay: `${index * 60}ms`,
                       }}
                     >
@@ -1620,6 +1740,9 @@ export default function Home() {
                           {renderImagePanel(caption, "thumb")}
                         </div>
                         <div className="min-w-0">
+                          <p className="text-[10px] uppercase tracking-[0.18em] text-amber-200/80">
+                            Up next {index + 1}
+                          </p>
                           <p className="truncate text-xs text-slate-200">
                             {caption.content ?? "No caption"}
                           </p>
@@ -1631,22 +1754,41 @@ export default function Home() {
                     </button>
                   );
                 })}
+                {queueCaptions.length === 0 && (
+                  <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-6 text-center text-xs text-slate-300">
+                    No queued captions yet.
+                  </div>
+                )}
               </div>
             </aside>
           </section>
         ) : (
           <section className="lux-float-in grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
-            {sortedCaptions.map((caption, index) => {
+            {filteredCaptions.map((caption, index) => {
               const myVote = myVotes[caption.id] ?? 0;
               const isSubmitting = submittingCaptionId === caption.id;
+              const netScore = rankScoreByCaption[caption.id] ?? 0;
 
               return (
                 <article
                   key={caption.id}
+                  onClick={() => {
+                    setViewMode("stage");
+                    focusCaption(caption.id);
+                  }}
                   className="lux-card lux-float-in group flex h-[430px] flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#121d3c]/80 shadow-[0_18px_45px_rgba(2,6,23,0.45)] transition hover:border-cyan-200/35"
                   style={{ animationDelay: `${(index % 9) * 55}ms` }}
                 >
-                  <div className="flex items-center justify-end border-b border-white/10 bg-black/20 px-3 py-2">
+                  <div className="flex items-center justify-between border-b border-white/10 bg-black/20 px-3 py-2">
+                    <div
+                      className={`rounded-full border px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.14em] ${
+                        sortMode === "top"
+                          ? "border-emerald-300/30 bg-emerald-400/10 text-emerald-100"
+                          : "border-white/10 bg-black/15 text-slate-400"
+                      }`}
+                    >
+                      Score {formatNetScore(netScore)}
+                    </div>
                     <p className="text-[11px] text-slate-400">
                       {relativeTime(caption.created_datetime_utc)}
                     </p>
@@ -1660,11 +1802,15 @@ export default function Home() {
                     <p className="min-h-[76px] rounded-xl border border-white/10 bg-black/20 px-3 py-3 text-sm leading-relaxed text-slate-100">
                       {caption.content ?? "No caption text."}
                     </p>
-                    <div className="mt-auto flex items-center justify-between gap-3">
-                      <div className="flex items-center gap-2 text-xs">
+                    <div className="mt-auto flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
                         <button
-                          onClick={() => submitVote(caption.id, 1)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void submitVote(caption.id, 1);
+                          }}
                           disabled={isSubmitting}
+                          title="Like this caption"
                           className={`rounded-full border px-3 py-1.5 font-medium transition ${
                             myVote === 1
                               ? "border-emerald-300 bg-emerald-400/25 text-emerald-100"
@@ -1674,8 +1820,12 @@ export default function Home() {
                           Like
                         </button>
                         <button
-                          onClick={() => submitVote(caption.id, -1)}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void submitVote(caption.id, -1);
+                          }}
                           disabled={isSubmitting}
+                          title="Dislike this caption"
                           className={`rounded-full border px-3 py-1.5 font-medium transition ${
                             myVote === -1
                               ? "border-rose-300 bg-rose-400/25 text-rose-100"
@@ -1684,15 +1834,29 @@ export default function Home() {
                         >
                           Dislike
                         </button>
+                        <span className="text-[11px] text-slate-400">
+                          {myVote === 1 ? "Liked" : myVote === -1 ? "Disliked" : "Not rated"}
+                        </span>
+                        <span
+                          className={`rounded-full border px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.14em] ${
+                            sortMode === "top"
+                              ? "border-emerald-300/30 bg-emerald-400/10 text-emerald-100"
+                              : "border-white/10 bg-black/15 text-slate-400"
+                          }`}
+                        >
+                          {formatNetScore(netScore)}
+                        </span>
                       </div>
                       <button
-                        onClick={() => {
+                        onClick={(event) => {
+                          event.stopPropagation();
                           setViewMode("stage");
                           focusCaption(caption.id);
                         }}
+                        title="Open this caption in stage view"
                         className="rounded-full border border-sky-200/35 px-3 py-1.5 text-xs font-medium text-sky-100 transition hover:bg-sky-400/10"
                       >
-                        Stage
+                        Open Stage
                       </button>
                     </div>
                     {isSubmitting && (
@@ -1704,6 +1868,11 @@ export default function Home() {
                 </article>
               );
             })}
+            {filteredCaptions.length === 0 && (
+              <div className="col-span-full rounded-[24px] border border-white/10 bg-[#121d3c]/70 p-8 text-center text-sm text-slate-300">
+                No captions match this filter yet.
+              </div>
+            )}
           </section>
         ))}
       </div>
@@ -1820,17 +1989,6 @@ export default function Home() {
             inset 0 1px 0 rgba(255, 255, 255, 0.08),
             0 22px 58px rgba(2, 6, 23, 0.48);
           position: relative;
-          overflow: hidden;
-        }
-
-        .lux-panel::after {
-          content: "";
-          position: absolute;
-          inset: -1px;
-          background: linear-gradient(110deg, transparent 20%, rgba(255, 255, 255, 0.08) 50%, transparent 80%);
-          transform: translateX(-110%);
-          animation: luxShimmer 9s ease-in-out infinite;
-          pointer-events: none;
         }
 
         .lux-card {
